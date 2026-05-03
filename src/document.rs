@@ -16,7 +16,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(not(target_arch = "wasm32"))]
-use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
@@ -49,24 +48,17 @@ pub enum ReadingOrder {
     ColumnAware,
 }
 
-/// Reader enum that dispatches between file-backed (native) and memory-backed (WASM) I/O.
-///
-/// On native builds, `open()` uses `BufReader<File>` to avoid reading the entire file
-/// into memory up front. On WASM (or when using `from_bytes()`), uses
-/// `BufReader<Cursor<Vec<u8>>>` for in-memory access.
+/// In-memory reader used by `open()` and `from_bytes()`. Wrapping in an enum
+/// is kept (rather than using `BufReader<Cursor<Vec<u8>>>` directly) so a
+/// future file-backed variant can be re-introduced without touching call
+/// sites.
 enum PdfReader {
-    /// File-backed reader for native builds — avoids reading entire file into memory.
-    #[cfg(not(target_arch = "wasm32"))]
-    File(BufReader<File>),
-    /// Memory-backed reader for WASM or `from_bytes()`.
     Memory(BufReader<Cursor<Vec<u8>>>),
 }
 
 impl Read for PdfReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
-            PdfReader::File(r) => r.read(buf),
             PdfReader::Memory(r) => r.read(buf),
         }
     }
@@ -75,8 +67,6 @@ impl Read for PdfReader {
 impl Seek for PdfReader {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
-            PdfReader::File(r) => r.seek(pos),
             PdfReader::Memory(r) => r.seek(pos),
         }
     }
@@ -85,16 +75,12 @@ impl Seek for PdfReader {
 impl BufRead for PdfReader {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
-            PdfReader::File(r) => r.fill_buf(),
             PdfReader::Memory(r) => r.fill_buf(),
         }
     }
 
     fn consume(&mut self, amt: usize) {
         match self {
-            #[cfg(not(target_arch = "wasm32"))]
-            PdfReader::File(r) => r.consume(amt),
             PdfReader::Memory(r) => r.consume(amt),
         }
     }
@@ -661,9 +647,18 @@ impl PdfDocument {
     /// ```
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
-        let reader = PdfReader::File(BufReader::new(file));
-        Self::open_from_reader(reader)
+        // Read once and route through `from_bytes` so the in-memory
+        // `source_bytes` field is populated. Path-loaded documents that
+        // skip this lose access to APIs that re-read the bytes
+        // (notably `compliance::convert_to_pdf_a`, which constructs a
+        // `DocumentEditor` from `source_bytes` — an empty Vec breaks
+        // it with `"Invalid PDF header: ... File is empty"`). See
+        // issue #456.
+        //
+        // The doc comment on this function already promised "Reads the
+        // entire file into memory"; this is making it true.
+        let data = std::fs::read(path.as_ref())?;
+        Self::from_bytes(data)
     }
 
     fn open_from_reader(mut reader: PdfReader) -> Result<Self> {
