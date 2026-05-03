@@ -2,6 +2,140 @@
 
 All notable changes to PDFOxide are documented here.
 
+## [0.3.43] - 2026-05-03
+
+> Cross-binding parity, WASI build target, and a basket of issue fixes.
+
+### Highlights
+
+- **`render_page_fit()` now ships in all five bindings** (Rust core +
+  Python, Node.js / TypeScript, C#, Go). Picks the largest DPI such
+  that both rendered dimensions fit inside a target pixel box,
+  preserving aspect ratio. No more "what DPI hits 1024×768?" math
+  on the caller's side. Fixes [#441](https://github.com/yfedoseev/pdf_oxide/issues/441),
+  closes [#448](https://github.com/yfedoseev/pdf_oxide/issues/448).
+- **Idiomatic page iteration parity across bindings.** Rust gets
+  `page_indices()`, Python gets `.pages`, Node.js gets
+  `[Symbol.asyncIterator]` (the sync `[Symbol.iterator]` was already
+  there). C# `Pages` and Go `Pages()` were already shipped. Closes
+  [#447](https://github.com/yfedoseev/pdf_oxide/issues/447).
+- **WASI build target** — `cargo build --target wasm32-wasip1` now
+  builds the lib cleanly on stable Rust. Unblocks @RALaBarge's
+  external `pdf-oxide-wasi` stdin→stdout wrapper and any other
+  consumer wanting to embed pdf_oxide in a sandboxed WASI runtime.
+  CI now gates that the WASI build stays green. Closes
+  [#214](https://github.com/yfedoseev/pdf_oxide/issues/214).
+- **Spurious-table fix on dense word grids** — Roland's #405 lands
+  via cherry-pick. A second density gate after the regular-row-ratio
+  check rejects 6-column word grids derived from two-column prose
+  that the existing validators were accepting as tables (compose
+  cleanly with the v0.3.42 `Table::is_real_grid` filter). Validated
+  against the 86-PDF cross-build corpus: 888 / 888 byte-equal —
+  zero observable change on common documents, the gate's value is
+  in the safety net for adversarial cases.
+
+### Fixes
+
+- **#456** — `PdfDocument::open(path)` now populates `source_bytes`,
+  unblocking `convert_to_pdf_a()`, the C FFI `pdf_document_get_source_bytes`,
+  and any other API that re-reads the in-memory copy. Path-loaded
+  documents previously got an empty `Vec<u8>` and hit
+  `"Invalid PDF header: File is empty (0 bytes read)"` from the
+  PDF/A converter. Reported by @potatochipcoconut on PR #445.
+- **#451** — Standard14 PostScript fonts with no open-source
+  equivalent (`Symbol`, `ZapfDingbats`) are now downgraded from
+  hard `FontNotEmbedded` errors to a new `KnownUnembeddableFont`
+  warning during PDF/A conversion. A document that's otherwise
+  compliant no longer fails solely because of one symbolic font.
+- **#395** — closed; verified the off-by-one C# `ExceptionMapper`
+  fix in v0.3.38 actually resolves the reported `RenderPage` →
+  `SignatureException [8500]`. Added a Rust regression test that
+  opens @gevorgter's exact reproducer PDF and asserts `render_page`
+  succeeds. The fixture is pinned in `pdf_oxide_tests`.
+
+### Behavior changes
+
+- `PdfDocument::open(path)` now reads the file once into memory
+  rather than streaming via `BufReader<File>`. The doc comment
+  already promised "Reads the entire file into memory"; this makes
+  it true. Memory usage on `open()` is now equivalent to
+  `from_bytes(std::fs::read(path)?)`. Required by #456; the
+  streaming reader was a partial optimisation no caller could rely
+  on (every code path that touched `source_bytes` already required
+  the in-memory copy).
+- `PdfReader` enum collapsed to a single in-memory variant —
+  removed unused `File` variant. `std::io::{Read, Seek, BufRead, …}`
+  imports are no longer cfg-gated, which is what unblocked the
+  wasm32-wasip1 build target.
+
+### Dependencies
+
+- Batch-applied 9 dependabot bumps onto `release/v0.3.43`:
+  CI workflows (`golangci-lint-action` v7→v9, `setup-go` 5.5→6.4,
+  `setup-node` 4.4→6.4, `github-script` SHA refresh,
+  `scorecard-action` 2.4.0→2.4.3), Go (`testify` 1.8→1.11 — was
+  declared but unimported, dropped entirely), JS (`rimraf` 5→6 —
+  `@types/node` deferred to a follow-up after a TypeScript-strict
+  shake-out), Python (`onnx` ≥1.14→≥1.19.1).
+- The RustCrypto 0.8 stack (`pkcs8 0.11`, `spki 0.8`, `der 0.8`,
+  `digest 0.11`, `crypto-common 0.2`, `block-buffer 0.12`) stays
+  pinned — `rsa 0.10` and `p256/p384 0.14` are still RC upstream.
+  See the existing pin note at `Cargo.toml:185-187`.
+
+### Internal
+
+- New `wasm32-wasip1` build smoke check in `.github/workflows/ci.yml`
+  alongside the existing `wasm32-unknown-unknown` job.
+- Regenerated SBOMs (`pdf_oxide_cli/sbom.cdx.json`,
+  `pdf_oxide_mcp/sbom.cdx.json`) for 0.3.43.
+- New regression tests:
+  - `tests/test_issue_456_path_open_source_bytes.rs`
+  - `tests/test_issue_447_page_indices.rs`
+  - `tests/test_issue_395_render_page.rs`
+- New unit tests on `compliance::converter::downgrade_known_unembeddable_fonts`.
+
+### Validation
+
+86-PDF stratified corpus comparison (academic, mixed, forms,
+government, newspapers, theses, plus the three #211 fixtures), 888
+sampled `(pdf, page, method)` triples across `extract_text`,
+`to_plain_text`, `to_markdown`, `to_html`:
+
+- v0.3.43 vs v0.3.42 — **888 / 888 byte-equal, zero deltas**
+- v0.3.43 vs PyPI v0.3.41 — 860 equal, 28 reorder/de-dup, 0 real
+  content losses (same profile as v0.3.42's regression report)
+
+### Community contributors
+
+This release exists because of the community. Special thanks to:
+
+- **[@RolandWArnold](https://github.com/RolandWArnold)** — landed
+  the spurious-table fix in [#405](https://github.com/yfedoseev/pdf_oxide/pull/405)
+  with a clean conservative threshold (`most_common_count / num_cols
+  ≥ 2/3`) and a doc-comment that explicitly flags it as a
+  heuristic, making it easy to revisit later. The fix composes
+  with v0.3.42's struct-tree-aware reading-order rewire without
+  any merge conflict.
+- **[@RALaBarge](https://github.com/RALaBarge)** — built an
+  external WASI binary wrapper for pdf_oxide
+  ([pdf-oxide-wasi](https://github.com/RALaBarge/pdf-oxide-wasi))
+  and reported in [#214](https://github.com/yfedoseev/pdf_oxide/issues/214)
+  that it required nightly Rust because of an internal
+  `ceil_char_boundary` call. That call was already removed; this
+  release fixes the second hidden blocker (cfg-gated `std::io`
+  imports) and adds CI gating so the WASI target stays green.
+- **[@gevorgter](https://github.com/gevorgter)** — flagged two
+  rendering-area gaps: the C# binding's misleading
+  `SignatureException` on `RenderPage` ([#395](https://github.com/yfedoseev/pdf_oxide/issues/395),
+  fixed in v0.3.38, regression-guarded here) and the lack of a
+  pixel-dimension render API ([#441](https://github.com/yfedoseev/pdf_oxide/issues/441),
+  closed by `render_page_fit` shipping in all five bindings).
+- **[@potatochipcoconut](https://github.com/potatochipcoconut)** —
+  surfaced the `convert_to_pdf_a` failure on path-loaded documents
+  while testing PR #445; the investigation traced it to the empty
+  `source_bytes` field and produced the one-line fix in this
+  release ([#456](https://github.com/yfedoseev/pdf_oxide/issues/456)).
+
 ## [0.3.42] - 2026-05-02
 
 > Text-extraction reading-order rewire — fixes [#211](https://github.com/yfedoseev/pdf_oxide/issues/211)
