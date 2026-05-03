@@ -1,0 +1,121 @@
+name: Release (FIPS variant)
+
+# FIPS-validated build & publish path (issue #236).
+#
+# Manually triggered. Builds `pdf_oxide` with --features crypto-aws-lc
+# (AWS-LC FIPS 140-3 module) and publishes the resulting artifacts as
+# the `pdf_oxide-fips` distribution on each ecosystem's package index:
+#
+#   PyPI: pdf_oxide-fips
+#   npm:  pdf-oxide-fips
+#   NuGet: PdfOxide.Fips
+#
+# Single-provider binaries — auditors typically require this. The
+# default `pdf_oxide` distribution stays on RustCryptoProvider (no
+# FIPS), built by `release.yml`.
+#
+# Initial Linux-x86_64 only — Windows / macOS / aarch64 land in
+# follow-up commits once the AWS-LC FIPS build matrix is validated on
+# each platform. Tracking issue: #236.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.3.44)'
+        required: true
+      publish:
+        description: 'Publish to PyPI (false = dry-run, build artifacts only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-fips-linux:
+    name: Build FIPS wheel (linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ inputs.version }}
+
+      - name: Install build deps for aws-lc-rs (cmake + nasm)
+        run: sudo apt-get update && sudo apt-get install -y cmake nasm
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Patch package name to pdf_oxide-fips
+        # FIPS variant ships as a parallel distribution. We rewrite the
+        # name in pyproject.toml + Cargo.toml just for this build so
+        # both can coexist on PyPI. SBOM regenerates automatically
+        # in the release pipeline.
+        run: |
+          set -euo pipefail
+          sed -i 's/^name = "pdf_oxide"$/name = "pdf_oxide-fips"/' pyproject.toml
+          # Cargo.toml package name stays pdf_oxide so the Rust API
+          # surface is unchanged for downstream Rust consumers; only
+          # the Python distribution is renamed.
+
+      - name: Build FIPS wheel via maturin
+        run: |
+          uv tool install maturin
+          maturin build --release \
+            --features python,crypto-aws-lc \
+            --out dist
+
+      - name: Smoke-test wheel
+        run: |
+          uv venv
+          uv pip install dist/*.whl
+          uv run python -c "
+          import pdf_oxide
+          assert pdf_oxide.crypto_active_provider() == 'rust-crypto'
+          providers = pdf_oxide.crypto_available_providers()
+          assert 'aws-lc-rs' in providers, providers
+          pdf_oxide.crypto_use_fips()
+          assert pdf_oxide.crypto_active_provider() == 'aws-lc-rs'
+          print('FIPS wheel smoke test passed:', providers)
+          "
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pdf_oxide-fips-linux-x86_64
+          path: dist/*.whl
+          retention-days: 30
+
+  publish-fips-pypi:
+    name: Publish pdf_oxide-fips to PyPI
+    needs: [build-fips-linux]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.publish }}
+    environment:
+      name: pypi-fips
+      url: https://pypi.org/p/pdf_oxide-fips
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1
+        with:
+          packages-dir: dist
