@@ -24,7 +24,6 @@ ignored = [
     "tokenizers",
     "tract-onnx",
     # WASM-only runtime deps (gated on `wasm` feature)
-    "getrandom",
     "getrandom_02",
     "web-sys",
 ]
@@ -256,7 +255,7 @@ js-sys = { version = "0.3", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 # Forwards Rust `log` macros to the browser console (issue #280)
 console_log = { version = "1", optional = true, features = ["color"] }
-getrandom = { version = "0.4", optional = true, features = ["wasm_js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2", optional = true, features = ["js"] }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 
@@ -336,7 +335,6 @@ wasm = [
     "dep:js-sys",
     "dep:console_error_panic_hook",
     "dep:console_log",
-    "dep:getrandom",
     "dep:getrandom_02",
     "dep:serde-wasm-bindgen",
     "logging",
@@ -380,7 +378,7 @@ signatures = [
 # for POSTing the TimeStampReq to a Time Stamp Authority. Kept behind a
 # dedicated feature so embedded / WASM / AOT C# builds don't pull in an
 # HTTP stack unless the consumer actually needs it.
-tsa-client = ["signatures", "dep:ureq", "dep:getrandom", "dep:cmpv2"]
+tsa-client = ["signatures", "dep:ureq", "dep:cmpv2"]
 
 # Barcode/QR code generation
 barcodes = ["dep:qrcode", "dep:barcoders"]

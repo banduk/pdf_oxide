@@ -20,10 +20,9 @@ use super::error::{Error, Result};
 use super::provider::{
     CryptoProvider, Hasher, SignatureVerifier, Signer, SigningKeyMaterial, SymmetricCipher,
 };
-use super::types::{
-    AesKeySize, AsymmetricAlgorithm, EcCurve, HashAlgorithm, Padding, RsaPublicKey, RsaScheme,
-    SigningAlgorithm,
-};
+use super::types::{AesKeySize, EcCurve, HashAlgorithm, Padding, RsaPublicKey};
+#[cfg(feature = "signatures")]
+use super::types::{AsymmetricAlgorithm, RsaScheme, SigningAlgorithm};
 
 /// The default Rust-only crypto provider.
 ///
