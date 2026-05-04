@@ -186,7 +186,7 @@ stringprep = "0.1" # SASLprep for Unicode PDF passwords (R>=5)
 # because compiling AWS-LC source adds ~5 minutes to a fresh build.
 # Enable via `--features crypto-aws-lc` (default: off, falls back to
 # `RustCryptoProvider`).
-aws-lc-rs = { version = "1", optional = true }
+aws-lc-rs = { version = "1", optional = true, features = ["fips"] }
 
 # Digital signatures (optional)
 # NOTE: der/spki/pkcs1/pkcs8/rsa/signature/cms are pinned to 0.7/0.9/0.10/2.x track.
@@ -301,7 +301,7 @@ logging = []
 # via `pdf_oxide::crypto::set_provider(...)` in your application's
 # main(); compiling with this feature alone does not change the
 # default behaviour.
-crypto-aws-lc = ["dep:aws-lc-rs"]
+crypto-aws-lc = ["dep:aws-lc-rs", "aws-lc-rs/fips"]
 
 # Real ICC colour management via qcms (Firefox's colour engine).
 # When enabled, ICCBased colour spaces and CMYK images are converted

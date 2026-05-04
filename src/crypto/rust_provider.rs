@@ -424,8 +424,9 @@ impl SignatureVerifier for RustVerifier {
                 // sha1 0.11 / md-5 0.11 trait-bound mismatch makes
                 // these unreachable in this provider; FIPS provider
                 // also rejects them.
-                return Err(Error::Verification(
-                    "SHA-1 / MD5 RSA-PSS not supported by RustCryptoProvider",
+                return Err(Error::Backend(
+                    "SHA-1 / MD5 RSA-PSS not supported by RustCryptoProvider \
+                     (rsa 0.9 ↔ sha1 0.11 / md-5 0.11 digest-trait mismatch)",
                 ));
             },
         };
