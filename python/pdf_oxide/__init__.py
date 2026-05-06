@@ -135,6 +135,9 @@ from .pdf_oxide import (  # noqa: E402
     StreamingTable,
     Table,
     TextSpan,
+    crypto_active_provider,
+    crypto_available_providers,
+    crypto_use_fips,
     disable_logging,
     generate_barcode_svg,
     generate_qr_svg,
@@ -193,5 +196,9 @@ __all__ = [
     "set_log_level",
     "get_log_level",
     "disable_logging",
+    # FIPS crypto-provider surface (issue #236)
+    "crypto_active_provider",
+    "crypto_available_providers",
+    "crypto_use_fips",
 ]
 __version__ = VERSION
