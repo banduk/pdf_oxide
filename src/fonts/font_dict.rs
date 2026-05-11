@@ -2418,23 +2418,46 @@ impl FontInfo {
         // ==================================================================================
         // PRIORITY 1: ToUnicode CMap (PDF Spec Section 9.10.2, Method 1)
         // ==================================================================================
+        //
+        // Per §9.10.2: if a ToUnicode CMap is PRESENT it is the authoritative source.
+        // For composite (Type0) fonts a present-but-incomplete ToUnicode means the
+        // unmapped codes genuinely have no Unicode equivalent.  Falling through to the
+        // predefined-CMap path (Priority 3 §9.10.2) for Type0 would guess wrong CJK
+        // characters and score near zero versus ground truth.  Therefore:
+        //
+        //   • ToUnicode hit → return the mapped string (or U+FFFD if it maps to FFFD
+        //     or a bare C0 control character).
+        //   • ToUnicode miss AND font is Type0 → return U+FFFD, do NOT fall through.
+        //   • ToUnicode miss AND font is NOT Type0 → fall through to lower priorities
+        //     (simple fonts with standard encoding still benefit from further lookup).
+        //
+        // Fix A (§9.10.2 Priority-3 guard): implemented in the CMap-miss branch below.
+        // Fix B (control-character filter): applied on CMap hits.
         if let Some(lazy_cmap) = &self.to_unicode {
             if let Some(cmap) = lazy_cmap.get() {
                 if let Some(unicode) = cmap.get(&char_code) {
-                    if unicode == "\u{FFFD}" {
-                        log::warn!(
-                            "ToUnicode CMap has U+FFFD for code 0x{:02X} in font '{}' - falling back to Priority 2",
-                            char_code, self.base_font
-                        );
-                    } else if unicode
+                    // Fix B: filter bare C0 control characters (U+0000–U+001F except
+                    // tab/LF/CR which are legitimate whitespace in extracted text).
+                    // These are never valid visible text and typically indicate a
+                    // broken ToUnicode entry.  Return U+FFFD and do NOT fall through
+                    // even for simple fonts — the CMap explicitly mapped this code.
+                    let is_c0_control = unicode
                         .chars()
-                        .all(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
-                        && !unicode.is_empty()
-                    {
-                        log::warn!(
-                            "ToUnicode CMap maps code 0x{:04X} to control char(s) in font '{}' - falling back",
+                        .all(|c| matches!(c as u32, 0x00..=0x08 | 0x0B..=0x0C | 0x0E..=0x1F))
+                        && !unicode.is_empty();
+
+                    if unicode == "\u{FFFD}" {
+                        log::debug!(
+                            "ToUnicode CMap has U+FFFD for code 0x{:02X} in font '{}' - returning U+FFFD",
                             char_code, self.base_font
                         );
+                        return Some("\u{FFFD}".to_string());
+                    } else if is_c0_control {
+                        log::debug!(
+                            "ToUnicode CMap maps code 0x{:04X} to C0 control char(s) in font '{}' - returning U+FFFD",
+                            char_code, self.base_font
+                        );
+                        return Some("\u{FFFD}".to_string());
                     } else {
                         return Some(unicode.clone());
                     }
@@ -2444,36 +2467,17 @@ impl FontInfo {
                         self.base_font, self.subtype, char_code, cmap.len()
                     );
 
-                    // #363: subset Type0 + Identity-H + Adobe-Identity ordering.
-                    // The font's CIDs are insertion-ordered and have no relation
-                    // to Unicode code points, so the Priority 2 Identity-H
-                    // CID-as-Unicode fallback (`char::from_u32(cid)`) produces
-                    // ASCII-shifted ciphertext (e.g. `%B+$%8A` on nougat_035.pdf).
-                    // Per ISO 32000-1 §9.10.2, a present ToUnicode CMap is the
-                    // authoritative char→Unicode mapping; a miss means the
-                    // glyph has no Unicode equivalent, so return U+FFFD rather
-                    // than fall through.
-                    //
-                    // Narrow on purpose: simple fonts (Type1/TrueType with
-                    // standard encoding) still fall through — their encoding
-                    // is a real mapping. CJK Type0 (Adobe-GB1/Japan1/etc.) also
-                    // falls through to the predefined-CMap path.
+                    // Fix A (§9.10.2): for composite (Type0) fonts a present ToUnicode
+                    // CMap is the authoritative mapping.  A miss means the glyph has no
+                    // Unicode equivalent — do NOT fall through to the predefined-CMap
+                    // path which would produce plausible-looking but wrong CJK chars.
+                    // This applies regardless of encoding name or CIDSystemInfo ordering.
                     if self.subtype == "Type0" {
-                        let is_identity_encoding = matches!(
-                            &self.encoding,
-                            Encoding::Standard(name) if name == "Identity-H" || name == "Identity-V"
-                        ) || matches!(
-                            &self.encoding,
-                            Encoding::Identity
+                        log::debug!(
+                            "Type0 font '{}': ToUnicode present but code 0x{:04X} not covered → U+FFFD (no Priority-3 fallback per §9.10.2)",
+                            self.base_font, char_code
                         );
-                        let is_identity_ordering = self
-                            .cid_system_info
-                            .as_ref()
-                            .map(|info| info.ordering == "Identity")
-                            .unwrap_or(false);
-                        if is_identity_encoding && is_identity_ordering {
-                            return Some("\u{FFFD}".to_string());
-                        }
+                        return Some("\u{FFFD}".to_string());
                     }
                 }
             } else {
@@ -4311,6 +4315,21 @@ fn decode_cjk_raw_charcode(
 /// - UniJIS-UCS2-H: Adobe-Japan1 (Japanese)
 /// - UniCNS-UCS2-H: Adobe-CNS1 (Traditional Chinese)
 /// - UniKS-UCS2-H: Adobe-Korea1 (Korean)
+
+/// Maximum valid CID for each Adobe character collection (Fix C – OOB guard).
+/// CIDs beyond these values have no defined Unicode mapping; return None early
+/// to avoid accidental wrap-around in future table expansions.
+///
+/// Sources:
+///   Adobe-GB1-5   (TN #5079): 30,283 CIDs (0–30,283)
+///   Adobe-Japan1-7 (TN #5078): 23,059 CIDs (0–23,059)
+///   Adobe-CNS1-7  (TN #5080): 20,316 CIDs (0–20,316)
+///   Adobe-Korea1-2 (TN #5093): 18,351 CIDs (0–18,351)
+const CID_MAX_GB1: u16 = 30_283;
+const CID_MAX_JAPAN1: u16 = 23_059;
+const CID_MAX_CNS1: u16 = 20_316;
+const CID_MAX_KOREA1: u16 = 18_351;
+
 fn lookup_predefined_cmap(
     cmap_name: &str,
     cid_system_info: &Option<CIDSystemInfo>,
@@ -4318,6 +4337,23 @@ fn lookup_predefined_cmap(
 ) -> Option<u32> {
     // Verify that we have CIDSystemInfo to match against the CMap
     let system_info = cid_system_info.as_ref()?;
+
+    // Fix C: guard out-of-bounds CIDs before hitting the lookup table.
+    // CIDs beyond the collection maximum have no defined Unicode mapping.
+    let max_cid = match system_info.ordering.as_str() {
+        "GB1" => CID_MAX_GB1,
+        "Japan1" => CID_MAX_JAPAN1,
+        "CNS1" => CID_MAX_CNS1,
+        "Korea1" => CID_MAX_KOREA1,
+        _ => return None,
+    };
+    if cid > max_cid {
+        log::debug!(
+            "CID {} exceeds max {} for ordering '{}' → returning None (OOB)",
+            cid, max_cid, system_info.ordering
+        );
+        return None;
+    }
 
     // Route to the appropriate CMap lookup based on name and character collection
     match (cmap_name, system_info.ordering.as_str()) {
@@ -6640,27 +6676,29 @@ mod tests {
 
     #[test]
     fn test_char_to_unicode_tounicode_fffd_fallback() {
-        // A ToUnicode mapping to U+FFFD should be treated as missing
-        // and fall back to encoding
+        // A ToUnicode mapping to U+FFFD means the font author explicitly declared
+        // "no Unicode equivalent" for this code.  Per Fix B (§9.10.2) the function
+        // must return U+FFFD and NOT fall through to the encoding-based path.
         let cmap_data = b"beginbfchar\n<0041> <FFFD>\nendbfchar";
         let font = make_font(|f| {
             f.to_unicode = Some(LazyCMap::new(cmap_data.to_vec()));
             f.encoding = Encoding::Standard("WinAnsiEncoding".to_string());
         });
-        // Should fall through FFFD and use WinAnsi → 'A'
-        assert_eq!(font.char_to_unicode(0x41), Some("A".to_string()));
+        // ToUnicode says U+FFFD → return U+FFFD, do NOT fall through to WinAnsi 'A'
+        assert_eq!(font.char_to_unicode(0x41), Some("\u{FFFD}".to_string()));
     }
 
     #[test]
     fn test_char_to_unicode_tounicode_control_char_fallback() {
-        // A ToUnicode mapping to control characters should be treated as missing
+        // A ToUnicode mapping to a C0 control character is filtered by Fix B.
+        // The function must return U+FFFD and NOT fall through to the encoding.
         let cmap_data = b"beginbfchar\n<0041> <0001>\nendbfchar";
         let font = make_font(|f| {
             f.to_unicode = Some(LazyCMap::new(cmap_data.to_vec()));
             f.encoding = Encoding::Standard("WinAnsiEncoding".to_string());
         });
-        // Control char mapping → fallback to WinAnsi → 'A'
-        assert_eq!(font.char_to_unicode(0x41), Some("A".to_string()));
+        // C0 control char (U+0001) → U+FFFD, do NOT fall through to WinAnsi 'A'
+        assert_eq!(font.char_to_unicode(0x41), Some("\u{FFFD}".to_string()));
     }
 
     // =========================================================================
@@ -7530,5 +7568,234 @@ mod tests {
 
         // Byte codes not in the standard-14 table fall back to default_width.
         assert_eq!(table[0], 1000.0, "NUL -> default_width fallback");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Fix A / B / C tests  (§9.10.2 Priority-3 guard + control filter + OOB CID)
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Build a minimal ToUnicode CMap stream that maps codes 0x0041–0x005A
+    /// (hex 2-byte keys) to U+0041–U+005A (A–Z).
+    fn make_tounicode_az() -> Vec<u8> {
+        let stream = concat!(
+            "/CIDInit /ProcSet findresource begin\n",
+            "12 dict begin\n",
+            "begincmap\n",
+            "/CIDSystemInfo 3 dict dup begin\n",
+            "  /Registry (Adobe) def\n",
+            "  /Ordering (UCS) def\n",
+            "  /Supplement 0 def\n",
+            "end def\n",
+            "/CMapName /Adobe-Identity-UCS def\n",
+            "/CMapType 2 def\n",
+            "1 begincodespacerange\n",
+            "<0000> <FFFF>\n",
+            "endcodespacerange\n",
+            "26 beginbfchar\n",
+            "<0041> <0041>\n",   // A
+            "<0042> <0042>\n",
+            "<0043> <0043>\n",
+            "<0044> <0044>\n",
+            "<0045> <0045>\n",
+            "<0046> <0046>\n",
+            "<0047> <0047>\n",
+            "<0048> <0048>\n",
+            "<0049> <0049>\n",
+            "<004A> <004A>\n",
+            "<004B> <004B>\n",
+            "<004C> <004C>\n",
+            "<004D> <004D>\n",
+            "<004E> <004E>\n",
+            "<004F> <004F>\n",
+            "<0050> <0050>\n",
+            "<0051> <0051>\n",
+            "<0052> <0052>\n",
+            "<0053> <0053>\n",
+            "<0054> <0054>\n",
+            "<0055> <0055>\n",
+            "<0056> <0056>\n",
+            "<0057> <0057>\n",
+            "<0058> <0058>\n",
+            "<0059> <0059>\n",
+            "<005A> <005A>\n",   // Z
+            "endbfchar\n",
+            "endcmap\n",
+            "CMapName currentdict /CMap defineresource pop\n",
+            "end\n",
+            "end\n",
+        );
+        stream.as_bytes().to_vec()
+    }
+
+    /// Build a minimal ToUnicode CMap that maps code 0x0001 to U+0007 (BEL).
+    fn make_tounicode_bel() -> Vec<u8> {
+        let stream = concat!(
+            "/CIDInit /ProcSet findresource begin\n",
+            "12 dict begin\n",
+            "begincmap\n",
+            "/CIDSystemInfo 3 dict dup begin\n",
+            "  /Registry (Adobe) def\n",
+            "  /Ordering (UCS) def\n",
+            "  /Supplement 0 def\n",
+            "end def\n",
+            "/CMapName /Test-BEL def\n",
+            "/CMapType 2 def\n",
+            "1 begincodespacerange\n",
+            "<0000> <FFFF>\n",
+            "endcodespacerange\n",
+            "1 beginbfchar\n",
+            "<0001> <0007>\n",   // BEL control character
+            "endbfchar\n",
+            "endcmap\n",
+            "CMapName currentdict /CMap defineresource pop\n",
+            "end\n",
+            "end\n",
+        );
+        stream.as_bytes().to_vec()
+    }
+
+    /// Construct a minimal Type0 FontInfo with the given ToUnicode stream and CIDSystemInfo.
+    fn make_type0_font(
+        to_unicode_stream: Option<Vec<u8>>,
+        encoding_name: &str,
+        cid_system_info: Option<CIDSystemInfo>,
+    ) -> FontInfo {
+        FontInfo {
+            base_font: "TestType0Font".to_string(),
+            subtype: "Type0".to_string(),
+            encoding: Encoding::Standard(encoding_name.to_string()),
+            to_unicode: to_unicode_stream.map(LazyCMap::new),
+            font_weight: None,
+            flags: None,
+            stem_v: None,
+            embedded_font_data: None,
+            truetype_cmap: std::sync::OnceLock::new(),
+            is_truetype_font: false,
+            widths: None,
+            first_char: None,
+            last_char: None,
+            default_width: 1000.0,
+            cid_to_gid_map: None,
+            cid_system_info,
+            cid_font_type: None,
+            cid_widths: None,
+            cid_default_width: 1000.0,
+            has_explicit_dw: false,
+            cff_gid_map: None,
+            multi_char_map: HashMap::new(),
+            byte_to_char_table: std::sync::OnceLock::new(),
+            byte_to_width_table: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Fix A — ToUnicode present but code not covered → U+FFFD (no Priority-3 fallback).
+    ///
+    /// A Type0 font with Adobe-GB1 ordering and a ToUnicode CMap covering only A–Z.
+    /// Querying code 0x0061 (not in CMap) must return U+FFFD, NOT a CJK character
+    /// that would result from the Priority-3 predefined CMap lookup.
+    #[test]
+    fn test_fix_a_tounicode_present_miss_returns_fffd_not_cjk() {
+        let cid_system_info = Some(CIDSystemInfo {
+            registry: "Adobe".to_string(),
+            ordering: "GB1".to_string(),
+            supplement: 2,
+        });
+        let font = make_type0_font(
+            Some(make_tounicode_az()),
+            "Identity-H",
+            cid_system_info,
+        );
+
+        // Code 0x0061 ('a') is NOT in the ToUnicode CMap (which only covers A–Z).
+        // The Priority-3 predefined CMap for Adobe-GB1 would map CID 97 to some
+        // Latin character.  With Fix A, the function must return U+FFFD instead.
+        let result = font.char_to_unicode(0x0061);
+        assert_eq!(
+            result,
+            Some("\u{FFFD}".to_string()),
+            "Type0 font with ToUnicode present but missing code 0x61 must return U+FFFD, \
+             not fall through to predefined CMap"
+        );
+
+        // Codes that ARE in the CMap (A–Z) must still work correctly.
+        assert_eq!(font.char_to_unicode(0x0041), Some("A".to_string()));
+        assert_eq!(font.char_to_unicode(0x005A), Some("Z".to_string()));
+    }
+
+    /// Fix A — ToUnicode absent, Priority-3 predefined CMap is triggered.
+    ///
+    /// A Type0 font with Adobe-Japan1 ordering and NO ToUnicode CMap.
+    /// Querying CID 843 must return U+3042 (あ) via the predefined CMap.
+    ///
+    /// The encoding must be Identity-H (not a UCS2/UTF16 variant) combined with a
+    /// non-Identity CIDSystemInfo ordering so the code reaches the
+    /// `!is_ucs2_or_utf16 && is_non_identity_ordering` branch (line ~2568) that
+    /// calls lookup_predefined_cmap directly.
+    #[test]
+    fn test_fix_a_no_tounicode_priority3_triggered() {
+        let cid_system_info = Some(CIDSystemInfo {
+            registry: "Adobe".to_string(),
+            ordering: "Japan1".to_string(),
+            supplement: 4,
+        });
+        // Identity-H with a non-Identity (Japan1) ordering: CIDs route through
+        // lookup_predefined_cmap, NOT treated as raw Unicode code points.
+        let font = make_type0_font(None, "Identity-H", cid_system_info);
+
+        // CID 843 maps to U+3042 (あ) per the Adobe-Japan1 collection.
+        let result = font.char_to_unicode(843);
+        assert_eq!(
+            result,
+            Some("\u{3042}".to_string()),
+            "Type0 font without ToUnicode must use predefined CMap for CID 843 → U+3042"
+        );
+    }
+
+    /// Fix C — OOB CID guard: CID well beyond the Adobe-GB1 maximum → None.
+    ///
+    /// lookup_predefined_cmap with an OOB CID must return None without panicking.
+    #[test]
+    fn test_fix_c_oob_cid_returns_none() {
+        let cid_system_info = Some(CIDSystemInfo {
+            registry: "Adobe".to_string(),
+            ordering: "GB1".to_string(),
+            supplement: 2,
+        });
+        // CID 99_999 is far beyond CID_MAX_GB1 (30_283).
+        // The function takes u16, so we use the max u16 value (65535) which still
+        // exceeds CID_MAX_GB1.
+        let result = lookup_predefined_cmap("UniGB-UCS2-H", &cid_system_info, 65535);
+        assert_eq!(result, None, "OOB CID (65535 > CID_MAX_GB1 30283) must return None");
+
+        // Same for Japan1.
+        let cid_japan = Some(CIDSystemInfo {
+            registry: "Adobe".to_string(),
+            ordering: "Japan1".to_string(),
+            supplement: 4,
+        });
+        let result_j = lookup_predefined_cmap("UniJIS-UCS2-H", &cid_japan, 65535);
+        assert_eq!(result_j, None, "OOB CID (65535 > CID_MAX_JAPAN1 23059) must return None");
+    }
+
+    /// Fix B — C0 control character filter: ToUnicode mapping to U+0007 (BEL) → U+FFFD.
+    ///
+    /// A ToUnicode CMap that explicitly maps code 0x0001 to U+0007 (BEL).
+    /// The function must return U+FFFD, not the BEL character.
+    #[test]
+    fn test_fix_b_control_char_filter_returns_fffd() {
+        let font = make_type0_font(
+            Some(make_tounicode_bel()),
+            "Identity-H",
+            None,
+        );
+
+        // Code 0x0001 maps to U+0007 (BEL) in the ToUnicode CMap.
+        // Fix B must intercept this and return U+FFFD.
+        let result = font.char_to_unicode(0x0001);
+        assert_eq!(
+            result,
+            Some("\u{FFFD}".to_string()),
+            "Code mapping to U+0007 (BEL) must be filtered to U+FFFD by Fix B"
+        );
     }
 }
