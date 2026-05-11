@@ -371,6 +371,45 @@ fn parse_struct_elem(
     // Check /Type (should be /StructElem, but optional)
     if let Some(type_obj) = dict.get("Type") {
         if let Some(type_name) = type_obj.as_name() {
+            if type_name == "OBJR" {
+                // Per PDF spec §14.7.4 Table 323, an OBJR (Object Reference) dictionary
+                // references a StructElem (or other PDF object) via its /Obj entry.
+                // Transparently dereference it so the caller gets the real StructElem.
+                if let Some(obj_ref_obj) = dict.get("Obj") {
+                    if let Some(obj_ref) = obj_ref_obj.as_reference() {
+                        if !visited.insert(obj_ref.id) {
+                            log::debug!(
+                                "OBJR: cycle detected — object {} already visited, skipping",
+                                obj_ref.id
+                            );
+                            return Ok(None);
+                        }
+                        match document.load_object(obj_ref) {
+                            Ok(resolved) => {
+                                return parse_struct_elem(
+                                    document,
+                                    &resolved,
+                                    role_map,
+                                    page_map,
+                                    deadline,
+                                    element_count,
+                                    visited,
+                                );
+                            },
+                            Err(e) => {
+                                log::warn!(
+                                    "OBJR: failed to load /Obj {} {}: {}",
+                                    obj_ref.id,
+                                    obj_ref.gen,
+                                    e
+                                );
+                                return Ok(None);
+                            },
+                        }
+                    }
+                }
+                return Ok(None);
+            }
             if type_name != "StructElem" {
                 return Ok(None); // Not a StructElem
             }

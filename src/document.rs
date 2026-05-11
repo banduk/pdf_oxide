@@ -4231,14 +4231,26 @@ impl PdfDocument {
             base_spans = base_spans.filter_by_rect(region, mode);
         }
 
-        // Structure tree: check MarkInfo first (cheap) to skip non-tagged PDFs.
+        // Structure tree: try to load when MarkInfo says "marked" OR when the
+        // catalog directly references a StructTreeRoot (PDF 1.4 documents such
+        // as hello_structure.pdf predate the MarkInfo dictionary but are still
+        // valid tagged PDFs per §14.7.1).  Checking the catalog for
+        // /StructTreeRoot is cheap — it's a single dictionary key lookup.
         let cached_tree = {
             let cached = self.structure_tree_cache.lock_or_recover().clone();
             match cached {
                 Some(tree) => tree,
                 None => {
                     let is_marked = self.mark_info().map(|m| m.marked).unwrap_or(false);
-                    let tree = if is_marked {
+                    // Fall back to checking the catalog directly when MarkInfo is
+                    // absent or /Marked is false — presence of /StructTreeRoot is
+                    // authoritative for "is this a tagged PDF" per the spec.
+                    let has_struct_tree_root = !is_marked && self
+                        .catalog()
+                        .ok()
+                        .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
+                        .unwrap_or(false);
+                    let tree = if is_marked || has_struct_tree_root {
                         self.structure_tree().ok().flatten().map(Arc::new)
                     } else {
                         None
@@ -10438,7 +10450,12 @@ impl PdfDocument {
                 Some(tree) => tree,
                 None => {
                     let is_marked = self.mark_info().map(|m| m.marked).unwrap_or(false);
-                    let tree = if is_marked {
+                    let has_struct_tree_root = !is_marked && self
+                        .catalog()
+                        .ok()
+                        .and_then(|cat| cat.as_dict().map(|d| d.contains_key("StructTreeRoot")))
+                        .unwrap_or(false);
+                    let tree = if is_marked || has_struct_tree_root {
                         self.structure_tree().ok().flatten().map(Arc::new)
                     } else {
                         None
