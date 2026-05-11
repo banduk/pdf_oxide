@@ -3805,7 +3805,7 @@ pub extern "C" fn pdf_render_page(
             set_error(error_code, ERR_INVALID_ARG);
             return ptr::null_mut();
         }
-        let d = handle_mut(doc);
+        let d = handle_ref(doc as *const _);
         let fmt = if format == 1 {
             RenderImageFormat::Jpeg
         } else {
@@ -3869,7 +3869,7 @@ pub extern "C" fn pdf_render_page_with_options(
             set_error(error_code, ERR_INVALID_ARG);
             return ptr::null_mut();
         }
-        let d = handle_mut(doc);
+        let d = handle_ref(doc as *const _);
         let fmt = if format == 1 {
             RenderImageFormat::Jpeg
         } else {
@@ -3938,7 +3938,7 @@ pub extern "C" fn pdf_render_page_region(
             set_error(error_code, ERR_INVALID_ARG);
             return ptr::null_mut();
         }
-        let d = handle_mut(doc);
+        let d = handle_ref(doc as *const _);
         let fmt = if format == 1 {
             RenderImageFormat::Jpeg
         } else {
@@ -3987,7 +3987,7 @@ pub extern "C" fn pdf_render_page_zoom(
             set_error(error_code, ERR_INVALID_ARG);
             return ptr::null_mut();
         }
-        let d = handle_mut(doc);
+        let d = handle_ref(doc as *const _);
         let dpi = (72.0 * zoom) as u32;
         let fmt = if format == 1 {
             RenderImageFormat::Jpeg
@@ -4034,7 +4034,7 @@ pub extern "C" fn pdf_render_page_fit(
             set_error(error_code, ERR_INVALID_ARG);
             return ptr::null_mut();
         }
-        let d = handle_mut(doc);
+        let d = handle_ref(doc as *const _);
         let fmt = if format == 1 {
             RenderImageFormat::Jpeg
         } else {
@@ -4078,7 +4078,7 @@ pub extern "C" fn pdf_render_page_thumbnail(
             set_error(error_code, ERR_INVALID_ARG);
             return ptr::null_mut();
         }
-        let d = handle_mut(doc);
+        let d = handle_ref(doc as *const _);
         let fmt = if format == 1 {
             RenderImageFormat::Jpeg
         } else {
@@ -4103,6 +4103,58 @@ pub extern "C" fn pdf_render_page_thumbnail(
     #[cfg(not(feature = "rendering"))]
     {
         let _ = (doc, page_index, _size, format);
+        set_error(error_code, _ERR_UNSUPPORTED);
+        ptr::null_mut()
+    }
+}
+
+/// Render a page and return the raw premultiplied RGBA8888 pixel buffer.
+///
+/// The caller retrieves the pixel bytes via `pdf_get_rendered_image_data` and
+/// the dimensions via `out_width`/`out_height` (set on success). Pixels are
+/// row-major, top-left origin; `data_len == *out_width * *out_height * 4`.
+/// Free the returned handle with `pdf_rendered_image_free`.
+///
+/// Returns null on error; check `error_code`. `out_width` and `out_height`
+/// are only written when the return value is non-null.
+#[no_mangle]
+pub extern "C" fn pdf_render_page_raw(
+    doc: *mut PdfDocument,
+    page_index: i32,
+    dpi: i32,
+    out_width: *mut i32,
+    out_height: *mut i32,
+    error_code: *mut i32,
+) -> *mut FfiRenderedImage {
+    #[cfg(feature = "rendering")]
+    {
+        if doc.is_null() || out_width.is_null() || out_height.is_null() {
+            set_error(error_code, ERR_INVALID_ARG);
+            return ptr::null_mut();
+        }
+        let effective_dpi = if dpi <= 0 { 150 } else { dpi as u32 };
+        let d = handle_ref(doc as *const _);
+        let opts = RustRenderOptions {
+            dpi: effective_dpi,
+            format: RenderImageFormat::RawRgba8,
+            ..Default::default()
+        };
+        match rendering::render_page(d, page_index as usize, &opts) {
+            Ok(img) => {
+                write_out(out_width, img.width as i32);
+                write_out(out_height, img.height as i32);
+                set_error(error_code, ERR_SUCCESS);
+                Box::into_raw(Box::new(FfiRenderedImage { inner: img }))
+            },
+            Err(e) => {
+                set_error(error_code, classify_error(&e));
+                ptr::null_mut()
+            },
+        }
+    }
+    #[cfg(not(feature = "rendering"))]
+    {
+        let _ = (doc, page_index, dpi, out_width, out_height);
         set_error(error_code, _ERR_UNSUPPORTED);
         ptr::null_mut()
     }

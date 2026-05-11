@@ -58,7 +58,7 @@ manual_checked_ops = "allow"
 
 [package]
 name = "pdf_oxide"
-version = "0.3.45"
+version = "0.3.46"
 # MSRV — driven up from 1.82 for v0.3.38. Transitive deps pulled in
 # this release push the floor to 1.88:
 #   - hybrid-array 0.4.10 (via RustCrypto) → edition 2024 → 1.85
@@ -190,9 +190,8 @@ aws-lc-rs = { version = "1", optional = true, features = ["fips"] }
 
 # Digital signatures (optional)
 # NOTE: der/spki/pkcs1/pkcs8/rsa/signature/cms are pinned to 0.7/0.9/0.10/2.x track.
-# der 0.8 + spki 0.8 are stable but the rest of the RustCrypto 0.8 stack
-# (pkcs1 0.8, pkcs8 0.11, rsa 0.10, cms 0.3, signature 3.0) are still RC as of 2026-04.
-# Upgrade the whole block together once all reach stable release.
+# Dependabot PRs #469/#467/#429/#389 track the 0.8 stack upgrades; merge once CI green.
+# cms 0.3 is still pre-release; upgrade cms + rsa + pkcs1 together when stable.
 x509-parser = { version = "0.18", optional = true }   # X.509 certificate parsing
 cms = { version = "0.2", optional = true }            # CMS/PKCS#7 signatures
 rsa = { version = "0.9", optional = true }            # RSA signing
@@ -264,6 +263,8 @@ pdfium-render = { version = "0.9", optional = true }
 
 # Rendering (optional - for page to image conversion)
 tiny-skia = { version = "0.12", optional = true }
+fast_image_resize = { version = "6", optional = true }                       # SIMD-accelerated image downscaling
+hayro-jbig2 = { version = "0.3", optional = true, default-features = false } # Pure-Rust JBIG2 decoder (Apache-2.0 OR MIT)
 fontdb = { version = "0.23", optional = true }
 rustybuzz = { version = "0.20", optional = true }
 
@@ -309,6 +310,11 @@ logging = []
 # via `pdf_oxide::crypto::set_provider(...)` in your application's
 # main(); compiling with this feature alone does not change the
 # default behaviour.
+#
+# IMPORTANT: `fips` is mutually exclusive with `legacy-crypto` (which
+# is on by default). Always build FIPS without default features:
+#   cargo build --no-default-features --features fips,icc
+# Combining `fips` with `legacy-crypto` is a compile-time error.
 fips = ["dep:aws-lc-rs", "aws-lc-rs/fips"]
 
 # Real ICC colour management via qcms (Firefox's colour engine).
@@ -362,7 +368,7 @@ wasm-ml = ["wasm", "ml"]
 debug-span-merging = []
 
 # Page rendering to images (pure Rust via tiny-skia)
-rendering = ["dep:tiny-skia", "system-fonts"]
+rendering = ["dep:tiny-skia", "dep:fast_image_resize", "system-fonts", "dep:hayro-jbig2"]
 
 # System font discovery (fontdb) + shaping (rustybuzz). v0.3.35 splits
 # this out of `rendering` so HTML+CSS→PDF can pick it up without pulling

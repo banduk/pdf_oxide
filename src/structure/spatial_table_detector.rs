@@ -5,7 +5,7 @@
 //! table markup in the structure tree.
 
 use crate::layout::text_block::TextSpan;
-use crate::structure::table_extractor::{Table, TableCell, TableRow};
+use crate::structure::table_extractor::{span_text_for_cell, Table, TableCell, TableRow};
 use std::collections::HashMap;
 
 /// Disjoint-set (union-find) with path compression.
@@ -3078,27 +3078,31 @@ fn extract_cell_text(cell_span_indices: &[usize], spans: &[TextSpan]) -> String 
     if cell_span_indices.is_empty() {
         return String::new();
     }
-    let mut span_entries: Vec<(f32, &str)> = cell_span_indices
+    let mut span_entries: Vec<(f32, String)> = cell_span_indices
         .iter()
-        .filter_map(|&idx| spans.get(idx).map(|s| (s.bbox.center().y, s.text.as_str())))
+        .filter_map(|&idx| {
+            spans
+                .get(idx)
+                .map(|s| (s.bbox.center().y, span_text_for_cell(s)))
+        })
         .collect();
     if span_entries.is_empty() {
         return String::new();
     }
     if span_entries.len() == 1 {
-        return span_entries[0].1.to_string();
+        return span_entries.remove(0).1;
     }
     span_entries.sort_by(|a, b| crate::utils::safe_float_cmp(b.0, a.0));
-    let mut lines: Vec<Vec<&str>> = Vec::new();
-    let mut current_line: Vec<&str> = vec![span_entries[0].1];
+    let mut lines: Vec<Vec<String>> = Vec::new();
+    let mut current_line: Vec<String> = vec![span_entries[0].1.clone()];
     let mut current_y = span_entries[0].0;
-    for &(y, text) in &span_entries[1..] {
+    for (y, text) in &span_entries[1..] {
         if (current_y - y).abs() <= 2.0 {
-            current_line.push(text);
+            current_line.push(text.clone());
         } else {
             lines.push(current_line);
-            current_line = vec![text];
-            current_y = y;
+            current_line = vec![text.clone()];
+            current_y = *y;
         }
     }
     lines.push(current_line);

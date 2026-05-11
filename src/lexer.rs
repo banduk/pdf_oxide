@@ -444,7 +444,29 @@ fn parse_r_token(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     Ok((&input[1..], Token::R))
 }
 
-/// Parse a single PDF token.
+/// Parse a bare identifier as a lenient fallback.
+///
+/// Some malformed PDFs use identifiers without a leading `/`, for example
+/// `OBJR` instead of the spec-correct `/OBJR`. The PDF spec does not define
+/// such bare words, but real-world parsers (poppler, pdfjs) treat them as
+/// Name tokens to avoid failing on otherwise-recoverable documents. We do
+/// the same as a last resort, consuming alphanumeric chars and `_-+*@.!^~`.
+fn parse_bare_identifier(input: &[u8]) -> IResult<&[u8], Token<'_>> {
+    let (rest, word) = take_while(|c: u8| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, b'_' | b'-' | b'+' | b'*' | b'@' | b'.' | b'!' | b'^' | b'~')
+    })(input)?;
+    if word.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TakeWhile1,
+        )));
+    }
+    let name = std::str::from_utf8(word).unwrap_or("");
+    Ok((rest, Token::Name(name.to_string())))
+}
+
+/// Parse a single PDF token (strict mode).
 ///
 /// This is the main entry point for the lexer. It skips whitespace/comments
 /// and then tries to parse any valid PDF token type.
@@ -472,6 +494,27 @@ pub fn token(input: &[u8]) -> IResult<&[u8], Token<'_>> {
         parse_number,         // Then numbers (42, 3.14)
         parse_literal_string, // Then literal strings
         parse_hex_string,     // Then hex strings
+    ))
+    .parse(input)
+}
+
+/// Parse a single PDF token with lenient bare-identifier fallback.
+///
+/// Like `token()`, but also accepts bare alphanumeric words (e.g. `OBJR`
+/// without the required `/` prefix). Only use this for object-body parsing
+/// where malformed PDFs may omit the `/` — **never** in content-stream
+/// operator scanning, where bare words are operators, not names.
+pub(crate) fn token_lenient(input: &[u8]) -> IResult<&[u8], Token<'_>> {
+    // Skip whitespace first
+    let (input, _) = skip_ws(input)?;
+
+    alt((
+        parse_keyword,
+        parse_name,
+        parse_number,
+        parse_literal_string,
+        parse_hex_string,
+        parse_bare_identifier, // Lenient fallback: bare words like OBJR → Name
     ))
     .parse(input)
 }

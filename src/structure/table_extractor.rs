@@ -106,6 +106,26 @@ impl Table {
             .filter(|r| r.cells.iter().filter(|c| !c.text.trim().is_empty()).count() >= 2)
             .count();
         let ratio = rows_with_two_or_more_filled_cells as f32 / self.rows.len() as f32;
+
+        // Wide tables (≥ 8 columns) are high-risk false positives: prose sentences
+        // can be split into many single-phrase cells by decorative rule lines.
+        // Real wide data tables have most rows densely filled (≥ 60% of columns);
+        // prose-split false tables have highly variable row fill counts (some rows
+        // have 1-2 filled cells, others have 10+), so the fraction of "dense" rows
+        // is well below 70%.
+        if self.col_count >= 8 {
+            let min_dense = ((self.col_count as f32 * 0.6) as usize).max(2);
+            let dense_rows = self
+                .rows
+                .iter()
+                .filter(|r| {
+                    r.cells.iter().filter(|c| !c.text.trim().is_empty()).count() >= min_dense
+                })
+                .count();
+            let dense_row_ratio = dense_rows as f32 / self.rows.len() as f32;
+            return self.rows.len() >= 3 && ratio >= 0.7 && dense_row_ratio >= 0.70;
+        }
+
         ratio >= 0.5
     }
 
@@ -208,16 +228,9 @@ impl Table {
             })
             .collect();
 
-        // Build separator line
-        let separator: String = col_widths
-            .iter()
-            .map(|&w| "\u{2500}".repeat(w))
-            .collect::<Vec<_>>()
-            .join("  ");
-
         let mut output = String::new();
 
-        for (r_idx, row) in self.rows.iter().enumerate() {
+        for row in &self.rows {
             let mut col_idx = 0;
             let mut cells_text = Vec::new();
             for cell in &row.cells {
@@ -245,16 +258,6 @@ impl Table {
             }
             output.push_str(cells_text.join("  ").trim_end());
             output.push('\n');
-
-            // Insert separator after header row(s) transition to body
-            if self.has_header
-                && row.is_header
-                && r_idx + 1 < self.rows.len()
-                && !self.rows[r_idx + 1].is_header
-            {
-                output.push_str(&separator);
-                output.push('\n');
-            }
         }
 
         output
@@ -410,22 +413,64 @@ pub fn extract_table_from_spans(
     table_elem: &StructElem,
     spans: &[crate::layout::TextSpan],
 ) -> Result<Table, Error> {
-    // Convert spans to TextBlocks for MCID matching
+    // Convert spans to TextBlocks for MCID matching, applying column-spanning
+    // decimal split so that "12.11" (sailing score columns) becomes "12 11".
     let text_blocks: Vec<TextBlock> = spans
         .iter()
         .filter(|s| s.mcid.is_some())
-        .map(|s| TextBlock {
-            chars: Vec::new(),
-            bbox: s.bbox,
-            text: s.text.clone(),
-            avg_font_size: s.font_size,
-            dominant_font: s.font_name.clone(),
-            is_bold: s.font_weight.is_bold(),
-            is_italic: s.is_italic,
-            mcid: s.mcid,
+        .map(|s| {
+            let text = span_text_for_cell(s);
+            TextBlock {
+                chars: Vec::new(),
+                bbox: s.bbox,
+                text,
+                avg_font_size: s.font_size,
+                dominant_font: s.font_name.clone(),
+                is_bold: s.font_weight.is_bold(),
+                is_italic: s.is_italic,
+                mcid: s.mcid,
+            }
         })
         .collect();
     extract_table(table_elem, &text_blocks)
+}
+
+/// Return the display text for a span when used as a table cell token.
+/// Mirrors `PdfDocument::push_span_text`: splits column-spanning decimals
+/// (e.g. "12.11" across adjacent score columns) at the decimal point.
+pub(super) fn span_text_for_cell(span: &crate::layout::TextSpan) -> String {
+    let text = &span.text;
+    // Must be an "N.M" pattern with all-digit parts and a single dot.
+    let dot_pos = match text.find('.') {
+        Some(p) if p > 0 && p < text.len() - 1 => p,
+        _ => return text.clone(),
+    };
+    if text[dot_pos + 1..].contains('.') {
+        return text.clone();
+    }
+    if !text[..dot_pos].chars().all(|c| c.is_ascii_digit()) {
+        return text.clone();
+    }
+    if !text[dot_pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+        return text.clone();
+    }
+    let char_count = text.chars().count();
+    let expected_width = if !span.char_widths.is_empty() {
+        let cw_sum: f32 = span.char_widths.iter().sum();
+        cw_sum * (char_count as f32 / span.char_widths.len() as f32)
+    } else if span.font_size > 0.0 {
+        // 0.50em per char: digits are narrower than average; keeps the
+        // fallback from producing false negatives on word_spans (char_widths=[]).
+        span.font_size * 0.50 * char_count as f32
+    } else {
+        return text.clone();
+    };
+    let gap = span.bbox.width - expected_width;
+    if span.font_size > 0.0 && gap > span.font_size * 1.0 {
+        format!("{} {}", &text[..dot_pos], &text[dot_pos + 1..])
+    } else {
+        text.clone()
+    }
 }
 
 /// Extract a table from a structure element tree.
@@ -558,16 +603,41 @@ fn extract_cell(
     let mut mcids = Vec::new();
     collect_mcids(cell_elem, &mut mcids);
 
-    // Find all text blocks that match these MCIDs
+    // Find all text blocks that match these MCIDs, joining them with position-aware
+    // spacing: insert a space only when there is a genuine horizontal gap between
+    // adjacent spans on the same line, or when spans are on different lines.
+    // This prevents spurious spaces inside CJK expressions like "Q（peu/d）" whose
+    // glyphs are stored as separate marked-content runs that abut each other.
     let mut cell_text = String::new();
+    let mut prev_block: Option<&TextBlock> = None;
     for mcid in &mcids {
         for block in text_blocks {
             if let Some(block_mcid) = block.mcid {
                 if block_mcid == *mcid {
-                    if !cell_text.is_empty() && !cell_text.ends_with(' ') {
-                        cell_text.push(' ');
+                    if !cell_text.is_empty() {
+                        let need_space = if let Some(prev) = prev_block {
+                            let y_diff = (block.bbox.y - prev.bbox.y).abs();
+                            let line_h = prev.bbox.height.max(block.bbox.height);
+                            if y_diff > line_h * 0.5 {
+                                // Different lines — always insert a space.
+                                true
+                            } else {
+                                // Same line — only insert a space when there is an actual
+                                // horizontal gap (> 15% of font size, matching document.rs).
+                                let gap = block.bbox.x - (prev.bbox.x + prev.bbox.width);
+                                let font_size =
+                                    prev.avg_font_size.max(block.avg_font_size).max(1.0);
+                                gap > font_size * 0.15
+                            }
+                        } else {
+                            !cell_text.ends_with(' ')
+                        };
+                        if need_space {
+                            cell_text.push(' ');
+                        }
                     }
                     cell_text.push_str(&block.text);
+                    prev_block = Some(block);
                     break;
                 }
             }
@@ -964,5 +1034,128 @@ mod tests {
 
         let result = extract_table_from_spans(&table_elem, &spans).unwrap();
         assert!(result.is_empty());
+    }
+
+    /// Regression test for issue-336-example: adjacent MCID spans (gap ≤ 0) must NOT
+    /// have a space inserted between them.  The PDF stores e.g. "Q" (MCID 1) and "（"
+    /// (MCID 2) as separate marked-content runs that abut each other on the same line.
+    /// Before the fix, extract_cell always inserted a space between any two MCID blocks,
+    /// producing "Q （peu/d）" instead of the correct "Q（peu/d）".
+    #[test]
+    fn test_extract_cell_adjacent_mcid_spans_no_space() {
+        use crate::layout::text_block::{Color, FontWeight};
+
+        // Build TD > [MCID 1, MCID 2, MCID 3]  (three adjacent spans on the same line)
+        let mut td = StructElem::new(StructType::TD);
+        td.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        td.add_child(StructChild::MarkedContentRef { mcid: 2, page: 0 });
+        td.add_child(StructChild::MarkedContentRef { mcid: 3, page: 0 });
+        let mut tr = StructElem::new(StructType::TR);
+        tr.add_child(StructChild::StructElem(Box::new(td)));
+        let mut table_elem = StructElem::new(StructType::Table);
+        table_elem.add_child(StructChild::StructElem(Box::new(tr)));
+
+        // Exact coordinates from issue-336 page 0 (Q（peu/d） column header):
+        //   "Q"     x=345.79 w=8.22  end=354.01
+        //   "（"    x=353.83 w=10.56 end=364.39   gap=-0.18 (overlap → no space)
+        //   "peu/d" x=364.39 w=25.24             gap=0.00  (touching → no space)
+        let base = crate::layout::TextSpan {
+            artifact_type: None,
+            text: String::new(),
+            bbox: Rect::new(0.0, 678.0, 0.0, 10.56),
+            font_name: "Test".to_string(),
+            font_size: 10.56,
+            font_weight: FontWeight::Normal,
+            is_italic: false,
+            is_monospace: false,
+            color: Color::black(),
+            mcid: None,
+            sequence: 0,
+            split_boundary_before: false,
+            offset_semantic: false,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 1.0,
+            primary_detected: false,
+            char_widths: vec![],
+        };
+        let spans = vec![
+            crate::layout::TextSpan {
+                text: "Q".into(),
+                bbox: Rect::new(345.79, 678.0, 8.22, 10.56),
+                mcid: Some(1),
+                ..base.clone()
+            },
+            crate::layout::TextSpan {
+                text: "（".into(),
+                bbox: Rect::new(353.83, 678.0, 10.56, 10.56),
+                mcid: Some(2),
+                ..base.clone()
+            },
+            crate::layout::TextSpan {
+                text: "peu/d".into(),
+                bbox: Rect::new(364.39, 678.0, 25.24, 10.56),
+                mcid: Some(3),
+                ..base.clone()
+            },
+        ];
+
+        let result = extract_table_from_spans(&table_elem, &spans).unwrap();
+        assert_eq!(
+            result.rows[0].cells[0].text, "Q（peu/d",
+            "adjacent MCID spans must not get a space inserted between them"
+        );
+    }
+
+    /// Companion test: MCID spans on different lines (multi-line cell) DO get a space.
+    #[test]
+    fn test_extract_cell_multiline_mcid_spans_have_space() {
+        let mut td = StructElem::new(StructType::TD);
+        td.add_child(StructChild::MarkedContentRef { mcid: 1, page: 0 });
+        td.add_child(StructChild::MarkedContentRef { mcid: 2, page: 0 });
+        let mut tr = StructElem::new(StructType::TR);
+        tr.add_child(StructChild::StructElem(Box::new(td)));
+        let mut table_elem = StructElem::new(StructType::Table);
+        table_elem.add_child(StructChild::StructElem(Box::new(tr)));
+
+        let base = crate::layout::TextSpan {
+            artifact_type: None,
+            text: String::new(),
+            bbox: Rect::new(0.0, 0.0, 0.0, 12.0),
+            font_name: "Test".to_string(),
+            font_size: 12.0,
+            font_weight: crate::layout::text_block::FontWeight::Normal,
+            is_italic: false,
+            is_monospace: false,
+            color: crate::layout::text_block::Color::black(),
+            mcid: None,
+            sequence: 0,
+            split_boundary_before: false,
+            offset_semantic: false,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 1.0,
+            primary_detected: false,
+            char_widths: vec![],
+        };
+        // Line 1: "Hello" ends at x=100, y=200.  Line 2: "World" starts at x=10, y=188.
+        // y_diff = 12 > line_h * 0.5 = 6 → different lines → space inserted.
+        let spans = vec![
+            crate::layout::TextSpan {
+                text: "Hello".into(),
+                bbox: Rect::new(10.0, 200.0, 90.0, 12.0),
+                mcid: Some(1),
+                ..base.clone()
+            },
+            crate::layout::TextSpan {
+                text: "World".into(),
+                bbox: Rect::new(10.0, 188.0, 90.0, 12.0),
+                mcid: Some(2),
+                ..base.clone()
+            },
+        ];
+
+        let result = extract_table_from_spans(&table_elem, &spans).unwrap();
+        assert_eq!(result.rows[0].cells[0].text, "Hello World");
     }
 }

@@ -77,6 +77,10 @@ pub struct FontInfo {
     /// Default width for CIDs not in cid_widths (Type0 fonts only)
     /// Per PDF Spec: default is 1000 if /DW not specified
     pub cid_default_width: f32,
+    /// Whether /DW was explicitly present in the CIDFont dictionary.
+    /// Used by has_explicit_widths() and get_glyph_width() to distinguish
+    /// a spec-default 1000 from an authored 1000 (F14/F15 fix).
+    pub has_explicit_dw: bool,
     /// Multi-character encoding map for compound glyph names (e.g. f_f → "ff")
     /// Stores mappings from character code to multi-char strings
     pub multi_char_map: HashMap<u8, String>,
@@ -658,10 +662,11 @@ impl FontInfo {
             cid_font_type,
             cid_widths,
             cid_default_width,
+            has_explicit_dw,
             descendant_tt_cmap,
         ) = if subtype == "Type0" {
             match Self::parse_descendant_fonts(font_dict, &base_font, doc) {
-                Ok((map, info, ftype, widths, dw, tt_cmap, desc_embedded)) => {
+                Ok((map, info, ftype, widths, dw, explicit_dw, tt_cmap, desc_embedded)) => {
                     log::info!(
                             "Font '{}': Parsed DescendantFonts - CIDFontType={}, CIDSystemInfo={}-{}, widths={}, embedded={}",
                             base_font,
@@ -679,7 +684,7 @@ impl FontInfo {
                     if desc_embedded.is_some() && embedded_font_data.is_none() {
                         embedded_font_data = desc_embedded;
                     }
-                    (map, info, ftype, widths, dw, tt_cmap)
+                    (map, info, ftype, widths, dw, explicit_dw, tt_cmap)
                 },
                 Err(e) => {
                     log::warn!(
@@ -687,11 +692,11 @@ impl FontInfo {
                         base_font,
                         e
                     );
-                    (Some(CIDToGIDMap::Identity), None, None, None, 1000.0, None)
+                    (Some(CIDToGIDMap::Identity), None, None, None, 1000.0, false, None)
                 },
             }
         } else {
-            (None, None, None, None, 1000.0, None)
+            (None, None, None, None, 1000.0, false, None)
         };
 
         // Pre-populate OnceLock with descendant's TrueType cmap if available.
@@ -737,6 +742,7 @@ impl FontInfo {
             default_width,
             cid_widths,
             cid_default_width,
+            has_explicit_dw,
             cff_gid_map,
             multi_char_map: diff_multi_char_map,
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -817,7 +823,8 @@ impl FontInfo {
         Option<CIDSystemInfo>,
         Option<String>,
         Option<HashMap<u16, f32>>,
-        f32,
+        f32,                  // cid_default_width
+        bool,                 // has_explicit_dw (F14/F15 fix)
         Option<TrueTypeCMap>, // TrueType cmap from descendant's embedded font
         Option<Arc<Vec<u8>>>, // Embedded font data from CIDFont's FontDescriptor
     )> {
@@ -1010,22 +1017,22 @@ impl FontInfo {
 
         // Parse /DW (default width for CIDs) - PDF Spec Section 9.7.4.3
         // Default is 1000 if not specified
-        let cid_default_width = cidfont_dict
-            .get("DW")
-            .and_then(|obj| {
-                // Resolve indirect reference if needed
-                let resolved = if let Some(r) = obj.as_reference() {
-                    doc.load_object(r).ok()
-                } else {
-                    Some(obj.clone())
-                };
-                resolved.and_then(|o| match &o {
-                    Object::Integer(i) => Some(*i as f32),
-                    Object::Real(r) => Some(*r as f32),
-                    _ => None,
-                })
+        let dw_value = cidfont_dict.get("DW").and_then(|obj| {
+            // Resolve indirect reference if needed
+            let resolved = if let Some(r) = obj.as_reference() {
+                doc.load_object(r).ok()
+            } else {
+                Some(obj.clone())
+            };
+            resolved.and_then(|o| match &o {
+                Object::Integer(i) => Some(*i as f32),
+                Object::Real(r) => Some(*r as f32),
+                _ => None,
             })
-            .unwrap_or(1000.0);
+        });
+        // F14/F15 fix: track whether /DW was explicitly present in the PDF.
+        let has_explicit_dw = dw_value.is_some();
+        let cid_default_width = dw_value.unwrap_or(1000.0);
 
         // Parse /W array (CID widths) - PDF Spec Section 9.7.4.3
         // Resolve /W reference if needed before parsing (common for large arrays)
@@ -1079,6 +1086,7 @@ impl FontInfo {
             Some(cid_font_type),
             cid_widths,
             cid_default_width,
+            has_explicit_dw,
             descendant_tt_cmap,
             descendant_embedded,
         ))
@@ -1761,14 +1769,27 @@ impl FontInfo {
     /// # }
     /// ```
     pub fn get_glyph_width(&self, char_code: u16) -> f32 {
-        // For Type0 (CID) fonts, check cid_widths first
-        // The char_code is the CID for these fonts
-        if let Some(cid_widths) = &self.cid_widths {
-            if let Some(&width) = cid_widths.get(&char_code) {
-                return width;
+        // For Type0 (CID) fonts, use /W array then fall back to /DW (cid_default_width).
+        // F15 fix: when /DW was NOT explicitly set (has_explicit_dw=false) and the char
+        // code has no entry in /W, fall through to default_width instead of returning
+        // the spec-default 1000.
+        // NOTE: ISO 32000-1 §9.7.4 Table 117 specifies the default for a missing /DW
+        // as 1000 units. This implementation intentionally deviates from that default
+        // because many non-fullwidth CID fonts omit /DW; returning 1000 for their glyphs
+        // over-estimates widths and disables the gap-correction heuristic. Purely
+        // fullwidth CJK fonts that omit /DW may have glyph widths under-estimated as
+        // a consequence — an acceptable trade-off for the common mixed-script case.
+        if self.subtype == "Type0" {
+            if let Some(cid_widths) = &self.cid_widths {
+                if let Some(&width) = cid_widths.get(&char_code) {
+                    return width;
+                }
             }
-            // CID not in /W array, use /DW default
-            return self.cid_default_width;
+            // Only use cid_default_width if /DW was explicitly present in the font dict.
+            if self.has_explicit_dw {
+                return self.cid_default_width;
+            }
+            // Fall through to default_width — same path as simple fonts without /Widths.
         }
 
         // For simple fonts, use the widths array
@@ -1787,16 +1808,63 @@ impl FontInfo {
         self.default_width
     }
 
-    /// Look up width from standard 14 font metrics when /Widths array is absent.
+    /// Look up width from standard 14 font metrics when /Widths array is absent
+    /// or the char code falls outside the [FirstChar, LastChar] range.
     fn get_standard_font_width(&self, char_code: u16) -> Option<f32> {
-        // Only apply for standard 14 fonts (no embedded data, no widths array)
-        if self.widths.is_some() || self.embedded_font_data.is_some() {
+        // If a /Widths array covers this specific char code, trust it — don't override
+        // with standard metrics. For chars OUTSIDE the range (including the common case
+        // where space U+0020 = 32 is below a FirstChar like 66) we prefer named-font
+        // metrics over the generic default_width (500), which is often too wide.
+        if let Some(widths) = &self.widths {
+            if let Some(first_char) = self.first_char {
+                let index = char_code as i32 - first_char as i32;
+                if index >= 0 && (index as usize) < widths.len() {
+                    return None; // within explicit widths range – use actual width
+                }
+            }
+        }
+        // F13 fix: use exact match against the canonical 14 standard PDF font names
+        // after stripping any SUBSET+ prefix (e.g. "ABCDEF+Helvetica" → "Helvetica").
+        // `contains` would incorrectly match "HelveticaCorp-Custom" as Helvetica.
+        let raw_name = &self.base_font;
+        let name: &str = if let Some(idx) = raw_name.find('+') {
+            // Strip subset prefix: the part after '+' is the actual font name
+            let suffix = &raw_name[idx + 1..];
+            if suffix.is_empty() {
+                raw_name
+            } else {
+                suffix
+            }
+        } else {
+            raw_name
+        };
+        // Canonical Standard-14 font names per ISO 32000-1 Annex D.
+        // "Helvetica-Oblique" is the name used by virtually all real-world PDFs;
+        // the spec's canonical PostScript name is "HelveticaOblique" (no hyphen).
+        // Both are accepted.
+        const STANDARD_14: &[&str] = &[
+            "Courier",
+            "Courier-Bold",
+            "Courier-BoldOblique",
+            "Courier-Oblique",
+            "Helvetica",
+            "Helvetica-Bold",
+            "Helvetica-BoldOblique",
+            "Helvetica-Oblique",
+            "HelveticaOblique",
+            "Times-Roman",
+            "Times-Bold",
+            "Times-BoldItalic",
+            "Times-Italic",
+            "Symbol",
+            "ZapfDingbats",
+        ];
+        if !STANDARD_14.contains(&name) {
             return None;
         }
-        let name = &self.base_font;
-        let is_times = name.contains("Times");
-        let is_helvetica = name.contains("Helvetica") || name.contains("Arial");
-        let is_courier = name.contains("Courier");
+        let is_times = name.starts_with("Times");
+        let is_helvetica = name.starts_with("Helvetica");
+        let is_courier = name.starts_with("Courier");
 
         if !is_times && !is_helvetica && !is_courier {
             return None;
@@ -2558,33 +2626,48 @@ impl FontInfo {
         // ==================================================================================
         // PRIORITY 2b: Unicode-based Predefined CMaps (Phase 3.2)
         // ==================================================================================
-        // For Type0 fonts with CIDSystemInfo (Adobe-Japan1, Adobe-GB1, etc.) that don't have
-        // ToUnicode CMaps. Use predefined CID-to-Unicode mappings based on the character
-        // collection ordering.
+        // For Type0 fonts without a ToUnicode CMap: follow PDF §9.10.2 priority order.
         //
-        // Per PDF Spec ISO 32000-1:2008 Section 9.7.5.2:
-        // "Predefined CMaps can be used for CID-keyed fonts without embedded ToUnicode CMaps"
+        // The spec defines two distinct encoding CMap kinds:
         //
-        // The encoding (Identity, CMap stream, etc.) maps byte codes → CIDs, but
-        // CID → Unicode mapping is determined by the CIDSystemInfo ordering alone.
+        //   (a) Byte-encoding CMaps (GBpc-EUC-H, GB-EUC-H, B5pc-H, EUC-H, KSC-EUC-H,
+        //       etc.): the value in the content stream is a raw multi-byte code in a
+        //       legacy encoding (GBK, EUC-CN, Big5, EUC-JP, EUC-KR).  §9.10.2 says to
+        //       map char code → CID first, but those encoding CMap tables are not
+        //       embedded here.  Decoding the raw bytes directly with encoding_rs is
+        //       equivalent (same Unicode output) and is permitted by the spec's fallback
+        //       clause: "there is no way to determine … a conforming reader may choose a
+        //       character code of their choosing."
+        //
+        //   (b) Identity / UCS2 CMaps (Identity-H, UniGB-UCS2-H, etc.): the value in
+        //       the content stream IS (or approximates) a CID.  Use the Adobe-XX CID →
+        //       Unicode table directly (§9.10.2 step b).
+        //
+        // `decode_cjk_raw_charcode` returns None for non-byte-encoding CMaps, so
+        // trying it first is safe: it is a no-op for Identity/UCS2 fonts.
         if self.subtype == "Type0" {
-            // Extract encoding name for the lookup (used for specific CMap matching)
             let enc_name = match &self.encoding {
                 Encoding::Standard(name) => name.clone(),
                 Encoding::Identity => "Identity-H".to_string(),
                 Encoding::Custom(_) => String::new(),
             };
+
+            // Step (a): try direct byte decode for legacy CJK byte-encoding CMaps.
+            // This is the correct primary path for GBpc-EUC-H, GB-EUC-H, B5pc-H,
+            // EUC-H, KSC-EUC-H, etc.  Returns None for Identity/UCS2 CMaps, in
+            // which case we fall through to the CID lookup below.
+            if let Some(result) =
+                decode_cjk_raw_charcode(char_code, &enc_name, &self.cid_system_info)
+            {
+                return Some(result);
+            }
+
+            // Step (b): CID → Unicode lookup for identity / UCS2 CMaps where the
+            // char code in the stream is already a CID (or very close to one).
             if let Some(unicode_codepoint) =
                 lookup_predefined_cmap(&enc_name, &self.cid_system_info, char_code as u16)
             {
                 if let Some(unicode_char) = char::from_u32(unicode_codepoint) {
-                    log::debug!(
-                        "Predefined CMap mapping: CID 0x{:04X} → '{}' (U+{:04X}) in font '{}'",
-                        char_code,
-                        unicode_char,
-                        unicode_codepoint,
-                        self.base_font
-                    );
                     return Some(unicode_char.to_string());
                 }
             }
@@ -3063,7 +3146,12 @@ impl FontInfo {
     /// `extract_text` output even though the PDF itself places them on
     /// distinct positions. See issue #328.
     pub fn has_explicit_widths(&self) -> bool {
-        self.widths.is_some() || self.cid_widths.is_some()
+        // F14 fix: return true only when the font actually has explicit width data.
+        // Previously returned true for ALL Type0 fonts, which disabled gap-correction
+        // for Type0 fonts with no /W or /DW — exactly the fonts that need correction.
+        // Now: true when /Widths is present (simple fonts), or when /W has entries
+        // (CID fonts), or when /DW was explicitly set in the CIDFont dictionary.
+        self.widths.is_some() || self.cid_widths.is_some() || self.has_explicit_dw
     }
 
     /// Check if this font is likely italic based on the font name.
@@ -3909,7 +3997,14 @@ fn standard_encoding_lookup(encoding: &str, code: u8) -> Option<String> {
             // Using ISO-8859-1 fallback here would produce wrong characters for ligatures,
             // smart quotes, accents, and other typographic characters.
             if (32..=126).contains(&code) {
-                Some((code as char).to_string())
+                // Most codes in 32–126 match ASCII, with one notable exception:
+                // 0x27 = "quoteright" → U+2019 (RIGHT SINGLE QUOTATION MARK)
+                // All other printable ASCII codes are identity-mapped.
+                let ch = match code {
+                    0x27 => '\u{2019}', // quoteright
+                    _ => code as char,
+                };
+                Some(ch.to_string())
             } else {
                 let unicode = match code {
                     // 0xA0-0xAF
@@ -4134,6 +4229,67 @@ fn standard_encoding_lookup(encoding: &str, code: u8) -> Option<String> {
     }
 }
 
+/// Decode a raw CJK multi-byte character code to Unicode using legacy encodings.
+///
+/// For Type0 fonts using named CJK CMaps (e.g., "GBK-EUC-H", "GB-EUC-H",
+/// "ETen-B5-H", "EUC-H", "KSC-EUC-H"), the 2-byte value read from the content
+/// stream is NOT an Adobe CID — it is a raw multi-byte encoding value (GBK,
+/// EUC-CN, Big5, EUC-JP, or EUC-KR).  Adobe-GB1 CIDs cap at ~30 553, so
+/// `lookup_predefined_cmap` always returns None for GBK values ≥ 0xA1A1, and
+/// the caller falls through to a broken `char::from_u32` path that maps them
+/// to Korean Hangul (same code-point range).
+///
+/// This function catches that case and decodes with encoding_rs so the correct
+/// CJK characters come out.
+fn decode_cjk_raw_charcode(
+    char_code: u32,
+    enc_name: &str,
+    cid_system_info: &Option<CIDSystemInfo>,
+) -> Option<String> {
+    let ordering = cid_system_info
+        .as_ref()
+        .map(|i| i.ordering.as_str())
+        .unwrap_or("");
+
+    // Determine which legacy encoding applies based on the CMap name and ordering.
+    // CMap names that imply raw legacy encoding (not CID-keyed identity):
+    let enc: Option<&'static encoding_rs::Encoding> = if enc_name.contains("GBK")
+        || enc_name.contains("GB-")
+        || enc_name.contains("GBpc")
+        || (enc_name.contains("EUC") && (ordering == "GB1" || enc_name.starts_with("GB")))
+    {
+        Some(encoding_rs::GBK)
+    } else if enc_name.contains("B5")
+        || enc_name.contains("CNS")
+        || (enc_name.contains("EUC") && ordering == "CNS1")
+    {
+        Some(encoding_rs::BIG5)
+    } else if enc_name.contains("EUC") && ordering == "Japan1" {
+        Some(encoding_rs::EUC_JP)
+    } else if (enc_name.contains("KSC") || enc_name.contains("KSCms")) && ordering == "Korea1" {
+        Some(encoding_rs::EUC_KR)
+    } else {
+        None
+    };
+
+    let enc = enc?;
+
+    // Reconstruct the raw bytes from the 2-byte char_code (big-endian)
+    let bytes: [u8; 2] = [((char_code >> 8) & 0xFF) as u8, (char_code & 0xFF) as u8];
+
+    let (decoded, _, errors) = enc.decode(&bytes);
+    if errors {
+        return None;
+    }
+    // Skip the replacement character U+FFFD (decoding failed)
+    let result = decoded.replace('\u{FFFD}', "");
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 /// Lookup Unicode code point for a CID in a predefined Unicode-based CMap.
 ///
 /// Predefined CMaps for CJK fonts map CID values from Adobe character collections to Unicode.
@@ -4251,6 +4407,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4278,6 +4435,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4308,6 +4466,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4335,6 +4494,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4368,6 +4528,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4402,6 +4563,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4435,6 +4597,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4466,6 +4629,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4595,6 +4759,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4714,6 +4879,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4751,6 +4917,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4781,6 +4948,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4815,6 +4983,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4845,6 +5014,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4875,6 +5045,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4909,6 +5080,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4939,6 +5111,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -4969,6 +5142,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5003,6 +5177,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5032,6 +5207,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5061,6 +5237,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5090,6 +5267,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5119,6 +5297,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5148,6 +5327,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5177,6 +5357,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5206,6 +5387,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5235,6 +5417,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5512,6 +5695,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: Some(cid_widths),
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5553,6 +5737,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: Some(cid_widths),
             cid_default_width: 800.0, // CID default width
+            has_explicit_dw: true,    // F15: /DW was explicitly set
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5562,7 +5747,7 @@ mod tests {
         // CID 1 has explicit width
         assert_eq!(font.get_glyph_width(1), 500.0);
 
-        // Other CIDs use cid_default_width (not default_width)
+        // Other CIDs use cid_default_width (not default_width) when has_explicit_dw=true
         assert_eq!(font.get_glyph_width(2), 800.0);
         assert_eq!(font.get_glyph_width(999), 800.0);
     }
@@ -5590,6 +5775,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5637,6 +5823,7 @@ mod tests {
             cid_font_type: Some("CIDFontType2".to_string()),
             cid_widths: Some(cid_widths),
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -5652,8 +5839,9 @@ mod tests {
         assert_eq!(font.get_glyph_width(200), 500.0);
         assert_eq!(font.get_glyph_width(201), 600.0);
 
-        // Default for unlisted CIDs
-        assert_eq!(font.get_glyph_width(300), 1000.0);
+        // F15 fix: has_explicit_dw=false → fall back to default_width (500.0), not cid_default_width.
+        // When /DW is not explicit in the PDF, we cannot trust cid_default_width as authoritative.
+        assert_eq!(font.get_glyph_width(300), 500.0);
     }
 
     // =========================================================================
@@ -5680,6 +5868,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -7178,6 +7367,7 @@ mod tests {
             default_width: 500.0,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -7216,6 +7406,7 @@ mod tests {
             default_width: 500.0,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -7250,6 +7441,7 @@ mod tests {
             default_width: 500.0,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -7282,6 +7474,7 @@ mod tests {
             default_width: 500.0,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
@@ -7320,6 +7513,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),

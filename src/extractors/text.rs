@@ -3246,7 +3246,6 @@ impl<'doc> TextExtractor<'doc> {
             // Gap between end of current span and start of next span
             let current_end_x = current.bbox.x + current.bbox.width;
             let gap = span.bbox.x - current_end_x;
-
             // Fallback-width correction (issue #328): When the previous
             // span's font has no explicit `/Widths` array, every glyph in
             // that span reports the 500/550/600-thousandths-of-em fallback
@@ -6751,6 +6750,7 @@ mod tests {
             cid_font_type: None,
             cid_widths: None,
             cid_default_width: 1000.0,
+            has_explicit_dw: false,
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),

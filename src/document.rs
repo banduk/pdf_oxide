@@ -120,6 +120,12 @@ const DEFAULT_XOBJECT_CACHE_MAX_ENTRIES: usize = 1024;
 /// this pairwise heuristic.
 const FORWARD_GAP_K: f32 = 1.25;
 
+/// Maximum allowed inter-span X gap inside a candidate same-line reorder run.
+/// If the candidate's tentative X-order contains a larger gap, the run is
+/// probably a disjoint footer/header/field layout rather than a local
+/// mixed-baseline repair.
+const SAME_LINE_REORDER_MAX_GAP_FACTOR: f32 = 3.0;
+
 // Re-export BoundedEntryCache from cache module for local use and backward compatibility
 pub(crate) use crate::cache::BoundedEntryCache;
 
@@ -397,8 +403,8 @@ pub struct PdfDocument {
         Mutex<BoundedEntryCache<ObjectRef, Vec<crate::extractors::PdfImage>>>,
     /// Regions marked for erasure per page. Mutex for `&self` write-path methods (#398).
     pub(crate) erase_regions: Mutex<HashMap<usize, Vec<crate::geometry::Rect>>>,
-    /// Cached decompressed content stream for last accessed page.
-    page_content_cache: Mutex<Option<(usize, std::sync::Arc<Vec<u8>>)>>,
+    /// LRU cache of decompressed page content streams, keyed by page index.
+    page_content_cache: Mutex<BoundedEntryCache<usize, std::sync::Arc<Vec<u8>>>>,
     /// Cached signatures of running headers/footers detected via cross-page
     /// repetition. A span whose normalized text matches a signature and
     /// sits near the top/bottom of the page is treated as an artifact.
@@ -411,6 +417,10 @@ pub struct PdfDocument {
     /// happens to echo into the header band on every page (B3: pdfa_010
     /// would otherwise drop "University of Oklahoma 2009").
     running_artifact_signatures: Mutex<Option<std::collections::HashMap<String, usize>>>,
+    /// Accumulated extraction warnings for programmatic inspection.
+    /// Populated when silent fallbacks occur (font not found, CMap absent, etc.).
+    /// Retrieve with [`PdfDocument::warnings`]; drain with [`PdfDocument::take_warnings`].
+    accumulated_warnings: Mutex<Vec<String>>,
 }
 
 // Compile-time verification that PdfDocument is Send + Sync.
@@ -765,8 +775,9 @@ impl PdfDocument {
                 DEFAULT_XOBJECT_CACHE_MAX_ENTRIES,
             )),
             erase_regions: Mutex::new(HashMap::new()),
-            page_content_cache: Mutex::new(None),
+            page_content_cache: Mutex::new(BoundedEntryCache::new(64)),
             running_artifact_signatures: Mutex::new(None),
+            accumulated_warnings: Mutex::new(Vec::new()),
         };
 
         // Initialize encryption immediately
@@ -913,6 +924,9 @@ impl PdfDocument {
             },
             Ok(false) => {
                 log::warn!("PDF is encrypted and requires a password");
+                self.push_warning(
+                    "PDF is encrypted and requires a password; call authenticate() before extracting text".to_string()
+                );
                 // Set handler anyway - user can call authenticate() later
             },
             Err(e) => {
@@ -2566,8 +2580,19 @@ impl PdfDocument {
             stream_obj_num
         );
 
-        // Ensure encryption is initialized if needed (lazy initialization)
-        self.ensure_encryption_initialized()?;
+        // Per PDF §7.6.3, object streams (/Type /ObjStm) shall NOT be individually
+        // encrypted.  Encryption initialization is therefore not required to read an
+        // ObjStm: the unencrypted parse path below is always attempted first.  If
+        // initialization fails (e.g. unsupported algorithm, no legacy-crypto feature),
+        // log and continue — the handler will be None and we'll use the no-decryption
+        // path, which is exactly what the spec mandates for ObjStm content.
+        if let Err(e) = self.ensure_encryption_initialized() {
+            log::debug!(
+                "Encryption init skipped for ObjStm {} load ({}); will parse without decryption",
+                stream_obj_num,
+                e
+            );
+        }
 
         // Load the object stream
         let stream_ref = ObjectRef::new(stream_obj_num, 0);
@@ -3044,7 +3069,16 @@ impl PdfDocument {
                 log::debug!("Page count from /Count: {}", count);
                 Ok(count)
             },
+            Err(Error::EncryptedPdf) => Err(Error::EncryptedPdf),
             Err(e) => {
+                // For encrypted PDFs any failure to read the page tree means we
+                // cannot access the content.  Scanning would also return Ok(0),
+                // so skip the fallback and surface the real error immediately.
+                if self.is_encrypted() {
+                    log::warn!("Page count failed for encrypted PDF: {}", e);
+                    return Err(Error::EncryptedPdf);
+                }
+
                 log::warn!("Failed to get page count from /Count: {}", e);
                 log::info!("Falling back to scanning page tree");
 
@@ -3118,6 +3152,12 @@ impl PdfDocument {
         let pages_dict = match pages_obj.as_dict() {
             Some(d) => d,
             None => {
+                // If the page tree root resolved to Null it usually means the
+                // PDF is encrypted and the page tree could not be decrypted.
+                // Surface the real error instead of silently reporting 0 pages.
+                if matches!(pages_obj, crate::object::Object::Null) && self.is_encrypted() {
+                    return Err(Error::EncryptedPdf);
+                }
                 log::warn!(
                     "Page tree root is {} (expected Dictionary), treating as 0 pages",
                     pages_obj.type_name()
@@ -4145,7 +4185,23 @@ impl PdfDocument {
     ) -> Result<String> {
         self.require_authenticated()?;
 
-        let base_spans = self.extract_spans(page_index)?;
+        let mut base_spans = self.extract_spans(page_index)?;
+
+        // Drop spans that fall inside any caller-specified exclusion region.
+        // This runs before the structure-tree and table pipelines so that
+        // excluded regions are stripped from all downstream processing paths.
+        if !options.exclude_regions.is_empty() {
+            use crate::layout::SpatialCollectionFiltering;
+            base_spans =
+                base_spans.exclude_rects(&options.exclude_regions, options.exclude_regions_mode);
+        }
+
+        // Keep only spans inside the caller-specified include region (if any).
+        // Applied after exclusions so that exclude takes precedence.
+        if let Some((ref region, mode)) = options.include_region {
+            use crate::layout::SpatialCollectionFiltering;
+            base_spans = base_spans.filter_by_rect(region, mode);
+        }
 
         // Structure tree: check MarkInfo first (cheap) to skip non-tagged PDFs.
         let cached_tree = {
@@ -4257,6 +4313,53 @@ impl PdfDocument {
                     }
                 }
 
+                // For tagged PDFs, collect the MCIDs that are actually owned by
+                // table cells. When a span's MCID is NOT in this set, the span is
+                // NOT part of the table even if it lies inside the table's bbox
+                // (e.g. a paragraph physically adjacent to a table that was tagged
+                // as a sibling <P> element, not as a <TD>). Filtering such spans
+                // by bbox alone would silently drop real content.
+                // Falls back to bbox-only filtering when no MCIDs are present
+                // (untagged PDFs or spatial-detection tables).
+                let table_cell_mcids: HashSet<u32> = tables
+                    .iter()
+                    .flat_map(|t| {
+                        t.rows
+                            .iter()
+                            .flat_map(|r| r.cells.iter().flat_map(|c| c.mcids.iter().copied()))
+                    })
+                    .collect();
+                // Returns true when span should be removed from the flow because
+                // it is owned by a table cell (will be re-emitted by render_text).
+                let span_in_table = |s: &crate::layout::TextSpan| -> bool {
+                    if !table_cell_mcids.is_empty() {
+                        if let Some(mcid) = s.mcid {
+                            // Tagged PDF: MCID decides ownership precisely.
+                            return table_cell_mcids.contains(&mcid);
+                        }
+                        // Tagged PDF but span has no MCID (widget/annotation):
+                        // keep in flow — better to duplicate than to silently drop.
+                        return false;
+                    }
+                    // Untagged PDF or no MCIDs in any cell: cell-bbox-based filter.
+                    // Using per-cell bboxes (rather than the coarser table bbox) prevents
+                    // dropping paragraph spans that lie inside the table's outer bounding
+                    // box but were not captured as table cells by the spatial detector.
+                    tables.iter().any(|t| {
+                        t.rows.iter().any(|r| {
+                            r.cells.iter().any(|c| {
+                                c.bbox.is_some_and(|b| {
+                                    Self::contains_rect_with_tolerance(
+                                        &b,
+                                        &s.bbox,
+                                        RETAIN_TOLERANCE,
+                                    )
+                                })
+                            })
+                        })
+                    })
+                };
+
                 let preserved_label_indices: std::collections::HashSet<usize> =
                     Self::identify_multi_row_labels(&spans)
                         .into_iter()
@@ -4281,28 +4384,13 @@ impl PdfDocument {
                         .collect();
 
                 if preserved_label_indices.is_empty() {
-                    spans.retain(|s| {
-                        !tables.iter().any(|t| {
-                            t.bbox.is_some_and(|b| {
-                                Self::contains_rect_with_tolerance(&b, &s.bbox, RETAIN_TOLERANCE)
-                            })
-                        })
-                    });
+                    spans.retain(|s| !span_in_table(s));
                 } else {
                     let kept: Vec<crate::layout::TextSpan> = spans
                         .drain(..)
                         .enumerate()
                         .filter_map(|(i, s)| {
-                            let in_table = tables.iter().any(|t| {
-                                t.bbox.is_some_and(|b| {
-                                    Self::contains_rect_with_tolerance(
-                                        &b,
-                                        &s.bbox,
-                                        RETAIN_TOLERANCE,
-                                    )
-                                })
-                            });
-                            if !in_table || preserved_label_indices.contains(&i) {
+                            if !span_in_table(&s) || preserved_label_indices.contains(&i) {
                                 Some(s)
                             } else {
                                 None
@@ -4337,6 +4425,11 @@ impl PdfDocument {
                 // vertically centred across several dense-column data rows)
                 // to sort at the top of their row block.
                 Self::reorder_rowspan_labels(&mut spans);
+
+                // Restore intra-line reading order after the row-aware band sort.
+                // Off-baseline glyphs (e.g. superscripts/subscripts) can land in
+                // adjacent bands and be emitted out of X order; fix that per line.
+                Self::reorder_same_line_runs(&mut spans);
             }
 
             // OCR fallback for scanned PDFs
@@ -4367,6 +4460,11 @@ impl PdfDocument {
                     && s.bbox.height.is_finite()
                     && s.font_size.is_finite()
             });
+
+            // Merge subscript/superscript spans into their base spans so that
+            // tokens like "k1" and "k2" appear as single words rather than
+            // as isolated fragments interleaved with other spans (pdfa_004).
+            Self::merge_sub_superscript_spans(&mut spans);
 
             // Inline table insertion (issue #315).
             //
@@ -4531,15 +4629,7 @@ impl PdfDocument {
                     }
                 }
 
-                for ch in span.text.chars() {
-                    if let Some(components) =
-                        crate::text::ligature_processor::get_ligature_components(ch)
-                    {
-                        text.push_str(components);
-                    } else {
-                        text.push(ch);
-                    }
-                }
+                Self::push_span_text(&mut text, span);
                 prev_span = Some(span);
             }
 
@@ -4554,12 +4644,12 @@ impl PdfDocument {
             text
         };
 
-        // Append text from non-widget annotations
-        let mut final_text = text;
-        self.append_non_widget_annotation_text(page_index, &mut final_text);
+        // Annotation text is already included via annotation_content_spans() in
+        // extract_spans() — do NOT call append_non_widget_annotation_text() here,
+        // as that would emit every annotation a second time.
 
         // Filter leaked PDF metadata
-        let final_text = Self::filter_leaked_metadata(&final_text);
+        let final_text = Self::filter_leaked_metadata(&text);
 
         // Normalize Kangxi Radicals
         let final_text = Self::normalize_kangxi_radicals(&final_text);
@@ -4590,6 +4680,19 @@ impl PdfDocument {
         // /Differences / AGL lookup returned the UTF-8 byte sequence
         // re-interpreted as Latin-1. Re-decode those runs in place.
         let cleaned_text = Self::repair_utf8_mojibake(&cleaned_text);
+
+        // Optionally expand Latin ligature characters to their component letters.
+        let cleaned_text = if options.expand_ligatures {
+            cleaned_text
+                .replace('\u{FB00}', "ff")
+                .replace('\u{FB01}', "fi")
+                .replace('\u{FB02}', "fl")
+                .replace('\u{FB03}', "ffi")
+                .replace('\u{FB04}', "ffl")
+                .replace(['\u{FB05}', '\u{FB06}'], "st")
+        } else {
+            cleaned_text
+        };
 
         Ok(cleaned_text)
     }
@@ -5340,7 +5443,17 @@ impl PdfDocument {
     /// (for example superscripts and subscripts) are not split by a fixed
     /// absolute tolerance.
     fn same_line_threshold(prev: &TextSpan, current: &TextSpan) -> f32 {
-        prev.font_size.max(current.font_size).max(1.0) * 0.5
+        let max_fs = prev.font_size.max(current.font_size).max(1.0);
+        let min_fs = prev.font_size.min(current.font_size).max(1.0);
+        // Continuous formula — avoids the step discontinuity at the 4×
+        // ratio boundary. Examples:
+        //   same-size 12 pt body: max(12×1.2, 12×0.3) = 14.4 pt  ← 1.2× leading
+        //   heading+body 24+10 pt: max(10×1.2, 24×0.3) = 12.0 pt  ← keeps para break
+        //   superscript 12+6 pt:   max(6×1.2, 12×0.3) = 7.2 pt   ← same line
+        // Prior formula was max_fs×0.5 for normal ratios; new formula uses 1.2× of the
+        // smaller font, which is wider and reduces false newlines for normal leading.
+        // Formula: max(min_fs * 1.2, max_fs * 0.3)
+        (min_fs * 1.2).max(max_fs * 0.3)
     }
 
     /// Returns `true` if `inner` is contained within `outer`,
@@ -5359,6 +5472,104 @@ impl PdfDocument {
             && inner.bottom() <= outer.bottom() + eps
     }
 
+    /// Returns `true` if a tentative left-to-right X-ordering of `run`
+    /// contains a horizontal gap exceeding
+    /// `SAME_LINE_REORDER_MAX_GAP_FACTOR * max(font_size)` between any
+    /// two consecutive spans. Used by [`reorder_same_line_runs`] to
+    /// reject candidate runs that are vertically close but horizontally
+    /// disjoint (e.g. tightly-set footer/header rows split across the
+    /// page).
+    ///
+    /// The slice is not mutated; the X-order is computed on a local
+    /// copy of `(left_x, right_x, font_size)` triples.
+    fn run_has_large_x_gap(run: &[TextSpan]) -> bool {
+        if run.len() < 2 {
+            return false;
+        }
+
+        let mut edges: Vec<(f32, f32, f32)> = run
+            .iter()
+            .map(|s| (s.bbox.x, s.bbox.x + s.bbox.width, s.font_size))
+            .collect();
+
+        edges.sort_by(|a, b| crate::utils::safe_float_cmp(a.0, b.0));
+
+        for pair in edges.windows(2) {
+            let prev = pair[0];
+            let cur = pair[1];
+
+            let gap = cur.0 - prev.1;
+            if gap <= 0.0 {
+                continue;
+            }
+
+            let max_fs = prev.2.max(cur.2).max(1.0);
+            if gap > SAME_LINE_REORDER_MAX_GAP_FACTOR * max_fs {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Re-sort same-line spans by X after row-aware band sorting.
+    ///
+    /// Row-aware sorting can place off-baseline glyphs such as superscripts or
+    /// subscripts in adjacent Y bands before their base glyphs. This helper finds
+    /// candidate runs with the existing same-line threshold, then tentatively views
+    /// each candidate in X order. If that tentative X order contains a large gap,
+    /// the candidate is treated as disjoint footer/header/field content and is
+    /// left in the existing row-aware order.
+    ///
+    /// At the slice level no spans are merged or dropped; successful candidates are
+    /// only permuted. Downstream text assembly may then emit the reordered spans
+    /// into one visual line, which is the user-observable effect.
+    fn reorder_same_line_runs(spans: &mut [TextSpan]) {
+        let mut i = 0;
+
+        while i < spans.len() {
+            let mut j = i + 1;
+
+            while j < spans.len() {
+                let anchor = &spans[i];
+                let prev = &spans[j - 1];
+                let cur = &spans[j];
+
+                let to_prev = (cur.bbox.y - prev.bbox.y).abs();
+                let to_anchor = (cur.bbox.y - anchor.bbox.y).abs();
+
+                let tol_prev = Self::same_line_threshold(prev, cur);
+                let tol_anchor = Self::same_line_threshold(anchor, cur);
+
+                if to_prev > tol_prev || to_anchor > tol_anchor {
+                    break;
+                }
+
+                j += 1;
+            }
+
+            if j - i > 1 {
+                if Self::run_has_large_x_gap(&spans[i..j]) {
+                    // Candidate spans are vertically close, but not horizontally
+                    // contiguous. Do not X-sort them into a fake line; preserve
+                    // the row-aware order established before this helper.
+                    i = j;
+                    continue;
+                }
+
+                spans[i..j].sort_by(|a, b| {
+                    let cmp = crate::utils::safe_float_cmp(a.bbox.x, b.bbox.x);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                    a.sequence.cmp(&b.sequence)
+                });
+            }
+
+            i = j;
+        }
+    }
+
     /// # Returns
     /// `true` if a space should be inserted between the spans
     fn should_insert_space(prev: &TextSpan, current: &TextSpan) -> bool {
@@ -5373,6 +5584,26 @@ impl PdfDocument {
             return false; // Different lines - no space needed
         }
 
+        // CJK scripts (Chinese, Japanese, Korean) do not use spaces between
+        // words. If both the tail of prev and the head of current are CJK characters,
+        // inserting a space would produce incorrect tokenisation.
+        let prev_tail = prev.text.chars().next_back();
+        let curr_head = current.text.chars().next();
+        let is_cjk = |c: char| {
+            matches!(
+                c as u32,
+                0x3040..=0x309F   // Hiragana
+                | 0x30A0..=0x30FF // Katakana
+                | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+                | 0x4E00..=0x9FFF // CJK Unified Ideographs
+                | 0xAC00..=0xD7AF // Hangul Syllables
+                | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
+            )
+        };
+        if prev_tail.is_some_and(is_cjk) && curr_head.is_some_and(is_cjk) {
+            return false;
+        }
+
         // Calculate horizontal gap
         let prev_end_x = prev.bbox.x + prev.bbox.width;
         let gap = current.bbox.x - prev_end_x;
@@ -5385,6 +5616,287 @@ impl PdfDocument {
         // Insert space if gap is significant
         // Also check that gap is not too large (might indicate column boundary)
         gap > space_threshold && gap < font_size * 5.0
+    }
+
+    /// Detect a span whose text is `N.M` (all-digit groups around one dot) and whose
+    /// bbox.width is >40% larger than char_widths imply.  This pattern occurs in
+    /// sailing-score / competition-table PDFs where two adjacent columns (e.g. Q8=1,
+    /// F9=10) are stored as a single Tj text run "1.10" spanning both column cells.
+    /// kreuzberg's GT tokenises them as separate words; we must split at the dot.
+    fn is_column_spanning_decimal(span: &TextSpan) -> bool {
+        let text = &span.text;
+        let dot_pos = match text.find('.') {
+            Some(p) if p > 0 && p < text.len() - 1 => p,
+            _ => return false,
+        };
+        if text[dot_pos + 1..].contains('.') {
+            return false;
+        }
+        if !text[..dot_pos].chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        if !text[dot_pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        let char_count = text.chars().count();
+        let expected_width = if !span.char_widths.is_empty() {
+            let cw_sum: f32 = span.char_widths.iter().sum();
+            cw_sum * (char_count as f32 / span.char_widths.len() as f32)
+        } else if span.font_size > 0.0 {
+            // Digits are narrower than average; 0.50em per char is a safe
+            // upper bound for all-digit strings (avoids the 0.60 fallback
+            // producing false negatives on column-spanning sailing scores
+            // when char_widths is empty, e.g. word_spans from extract_words).
+            span.font_size * 0.50 * char_count as f32
+        } else {
+            return false;
+        };
+        // Use absolute gap (bbox_w - expected) rather than a ratio so that
+        // 5-char spans like "12.11" (gap ≈ 1.1×fs) are caught along with
+        // 4-char spans like "1.10" (gap ≈ 1.4×fs).  1.0×font_size is a safe
+        // lower bound: normal text rarely has >1em of hidden whitespace.
+        let gap = span.bbox.width - expected_width;
+        span.font_size > 0.0 && gap > span.font_size * 1.0
+    }
+
+    /// When a CID font's glyph iteration produces fewer advance-width entries than
+    /// `decode_text_to_unicode` produces unicode chars, `char_widths.len()` < char count.
+    /// This indicates two concatenated text runs stored in one Tj operator (e.g. "Theorem1.7"
+    /// where "Theorem" widths come from the font's glyph table and "1.7" doesn't have
+    /// matching glyph entries).  Return the byte offset at which to insert a space,
+    /// or None if no split is appropriate.
+    fn char_widths_boundary_split(span: &TextSpan) -> Option<usize> {
+        let cw_len = span.char_widths.len();
+        if cw_len == 0 {
+            return None;
+        }
+        let char_count = span.text.chars().count();
+        if cw_len >= char_count {
+            return None;
+        }
+        // Find the byte offset of the (cw_len)-th character
+        let (boundary_byte, boundary_char) = span.text.char_indices().nth(cw_len)?;
+        let prev_char = span.text[..boundary_byte].chars().next_back()?;
+        // Don't insert if either side is already a space
+        if boundary_char == ' ' || prev_char == ' ' {
+            return None;
+        }
+        // Non-ASCII chars at the boundary are encoding artifacts (e.g. Polish diacritics
+        // in Latin-2 / CP1250 fonts producing one fewer char_width entry).  Only split
+        // when the boundary char is ASCII, indicating a genuine text-run concatenation.
+        if !boundary_char.is_ascii() {
+            return None;
+        }
+        // Split at letter→digit boundary (e.g. "Theorem1.7") or lower→upper ASCII
+        // case boundary (e.g. "BigText" from concatenated CID runs "Big"+"Text").
+        // Upper→lower transitions are excluded: a ligature spanning an upper→lower
+        // boundary within a compound word (e.g. "officeMax" with "fl" ligature)
+        // would otherwise produce a false split.
+        if (prev_char.is_alphabetic() && boundary_char.is_ascii_digit())
+            || (prev_char.is_ascii_lowercase() && boundary_char.is_ascii_uppercase())
+        {
+            Some(boundary_byte)
+        } else {
+            None
+        }
+    }
+
+    /// Merge subscript and superscript spans into their base span.
+    ///
+    /// In math-heavy untagged PDFs, subscript glyphs (e.g. the "1" in "k₁") are
+    /// stored as separate `TextSpan` entries at a slightly lower/higher baseline than
+    /// the base character, and non-adjacent in reading order. The text assembly loop
+    /// emits them as isolated tokens ("k … 1") rather than the expected word ("k1").
+    ///
+    /// A span is classified as a subscript/superscript when ALL of the following hold:
+    ///  - 1–3 ASCII alphanumeric chars (digit or letter, no punctuation)
+    ///  - font_size < 85 % of the page's maximum font size
+    ///  - There exists a preceding "base" span whose right edge (x + width) is within
+    ///    ±0.6 × sub_fs of the subscript's left edge (x-adjacent)
+    ///  - The vertical offset between base and sub is in [8 %, 85 %] of base_fs
+    ///    (distinguishes true sub/superscripts from same-line small caps)
+    ///
+    /// Matched subscript/superscript spans have their text appended to the base and
+    /// are removed from `spans`.
+    fn merge_sub_superscript_spans(spans: &mut Vec<TextSpan>) {
+        let n = spans.len();
+        if n < 2 {
+            return;
+        }
+        let max_fs = spans.iter().map(|s| s.font_size).fold(0f32, f32::max);
+        if max_fs <= 0.0 {
+            return;
+        }
+
+        // For each candidate sub/superscript span, record which base span to merge into.
+        let mut to_merge: Vec<(usize, usize)> = Vec::new(); // (base_idx, sub_idx)
+        let mut already_sub: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        for i in 0..n {
+            let sub = &spans[i];
+            if sub.text.is_empty() || sub.text.len() > 3 {
+                continue;
+            }
+            if !sub.text.chars().all(|c| c.is_ascii_alphanumeric()) {
+                continue;
+            }
+            // Must be clearly smaller than the dominant font on this page.
+            if sub.font_size >= max_fs * 0.80 {
+                continue;
+            }
+            let sub_fs = sub.font_size;
+            let sub_x = sub.bbox.x;
+            let sub_y = sub.bbox.y;
+
+            // Search backwards for the best-matching base span.
+            let search_limit = 30.min(i);
+            let mut best: Option<(usize, f32)> = None; // (idx, |x_dist|)
+
+            for j in (i.saturating_sub(search_limit)..i).rev() {
+                if already_sub.contains(&j) {
+                    continue;
+                }
+                let base = &spans[j];
+                // Base must be at least 25 % larger than the sub (sub_fs ≤ 0.80×base_fs).
+                if base.font_size < sub_fs * 1.25 {
+                    continue;
+                }
+                // Base span must be a valid subscript host:
+                //   • 1-char bases (single math variable: k, γ, ρ, H, ∆, …)
+                //   • 2-char bases that are NOT two lowercase-ASCII letters
+                //     (accepts "Pr", "εp", "ρε" but rejects "of", "to")
+                // Multi-char lowercase-only strings like "and", "let", "sup"
+                // are English words or common operators; their adjacent digit
+                // spans are handled by the assembly loop and char_widths_boundary_split.
+                let chars: Vec<char> = base.text.chars().collect();
+                let is_valid_base = match chars.len() {
+                    1 => true,
+                    2 => chars.iter().any(|c| !c.is_ascii_lowercase()),
+                    _ => false,
+                };
+                if !is_valid_base {
+                    continue;
+                }
+                let base_right = base.bbox.x + base.bbox.width;
+                let x_dist = sub_x - base_right;
+                let y_diff_abs = (base.bbox.y - sub_y).abs();
+
+                // Use em-relative x_dist thresholds.
+                // Real sub/superscript glyphs land within ±[−0.1×base_fs, 0.25×base_fs]
+                // of the base's advance edge; absolute bounds were wrong for non-12pt fonts.
+                let base_fs = base.font_size.max(1.0);
+                let x_lo = -0.1 * base_fs;
+                let x_hi = 0.25 * base_fs;
+                if x_dist < x_lo || x_dist > x_hi {
+                    continue;
+                }
+                // Vertical offset must be in the sub/superscript range.
+                // Lower bound 12 % of base_fs ensures same-line small caps are excluded.
+                // Upper bound 75 % excludes large line-to-line y differences (e.g.
+                // author affiliation numbers on a different baseline row).
+                if y_diff_abs < base.font_size * 0.12 || y_diff_abs > base.font_size * 0.75 {
+                    continue;
+                }
+                let score = x_dist.abs();
+                if best.is_none() || score < best.unwrap().1 {
+                    best = Some((j, score));
+                }
+            }
+
+            if let Some((base_idx, _)) = best {
+                to_merge.push((base_idx, i));
+                already_sub.insert(i);
+            }
+        }
+
+        if to_merge.is_empty() {
+            return;
+        }
+
+        // Collect (base_idx, sub_idx, sub_text, sub_right_edge, sub_char_widths, sub_fs)
+        // before mutating spans.
+        let ops: Vec<(usize, usize, String, f32, Vec<f32>, f32)> = to_merge
+            .iter()
+            .map(|pair| {
+                let (bi, si) = *pair;
+                let sub = &spans[si];
+                (
+                    bi,
+                    si,
+                    sub.text.clone(),
+                    sub.bbox.x + sub.bbox.width,
+                    sub.char_widths.clone(),
+                    sub.font_size,
+                )
+            })
+            .collect();
+
+        // Apply: append sub text to base; extend bbox and char_widths to cover the sub.
+        //
+        // Extending bbox: the assembly loop uses span widths for gap calculations — keeping
+        // the original width would make the gap to the following span appear too large.
+        //
+        // Extending char_widths: char_widths_boundary_split fires whenever cw_len < char_count.
+        // After merging sub text, char_count grows but cw_len stays the same, which would
+        // cause the split to re-separate the merged token (e.g. "k1" → "k 1").  Adding
+        // estimated widths for the sub characters prevents this.
+        for (base_idx, _, sub_text, sub_right, sub_cw, sub_fs) in &ops {
+            let base = &mut spans[*base_idx];
+            base.text.push_str(sub_text);
+            let base_right = base.bbox.x + base.bbox.width;
+            if *sub_right > base_right {
+                base.bbox.width = sub_right - base.bbox.x;
+            }
+            if !base.char_widths.is_empty() {
+                let sub_char_count = sub_text.chars().count();
+                if !sub_cw.is_empty() {
+                    base.char_widths.extend_from_slice(sub_cw);
+                } else {
+                    // Estimate sub char widths at 0.50 em per character.
+                    let w = sub_fs * 0.50;
+                    for _ in 0..sub_char_count {
+                        base.char_widths.push(w);
+                    }
+                }
+            }
+        }
+
+        // Remove the sub spans in reverse index order to preserve earlier indices.
+        let mut to_remove: Vec<usize> = ops.iter().map(|(_, si, _, _, _, _)| *si).collect();
+        to_remove.sort_unstable();
+        to_remove.dedup();
+        for idx in to_remove.iter().rev() {
+            spans.remove(*idx);
+        }
+    }
+
+    /// Append span text to `out`, splitting merged runs for cleaner word tokenisation.
+    /// Priority 0: spans whose text is entirely `\n`/`\r` are line-break signals.
+    /// Priority 1: column-spanning decimal (nougat_018 sailing tables).
+    /// Priority 2: char_widths boundary split (pdfa_004 CID-font merge artifacts).
+    #[inline]
+    fn push_span_text(out: &mut String, span: &TextSpan) {
+        // A span whose entire text is one or more newline/CR characters is a
+        // ToUnicode line-break signal.  Treat it as a logical newline separator rather
+        // than emitting the raw control characters verbatim as visible content.
+        if !span.text.is_empty() && span.text.chars().all(|c| c == '\n' || c == '\r') {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            return;
+        }
+        if Self::is_column_spanning_decimal(span) {
+            let dot = span.text.find('.').unwrap();
+            out.push_str(&span.text[..dot]);
+            out.push(' ');
+            out.push_str(&span.text[dot + 1..]);
+        } else if let Some(split) = Self::char_widths_boundary_split(span) {
+            out.push_str(&span.text[..split]);
+            out.push(' ');
+            out.push_str(&span.text[split..]);
+        } else {
+            out.push_str(&span.text);
+        }
     }
 
     /// Parse font size from a /DA (Default Appearance) string.
@@ -5710,6 +6222,162 @@ impl PdfDocument {
         spans
     }
 
+    /// Build TextSpan objects from the /Contents field of content-bearing annotations.
+    ///
+    /// Sticky note (/Subtype/Text), FreeText, Stamp, and markup annotations carry
+    /// human-readable text in their /Contents field.  Widget annotations are already
+    /// handled by `extract_widget_spans`; Popup annotations hold no independent
+    /// content (their text belongs to the parent annotation).
+    fn annotation_content_spans(&self, page_index: usize) -> Vec<TextSpan> {
+        use crate::geometry::Rect;
+
+        let page_obj = match self.get_page(page_index) {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+        let page_dict = match page_obj.as_dict() {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+
+        let annots_arr = match page_dict.get("Annots") {
+            Some(Object::Array(arr)) => arr.clone(),
+            Some(Object::Reference(r)) => match self.load_object(*r) {
+                Ok(Object::Array(arr)) => arr,
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+
+        let mut spans: Vec<TextSpan> = Vec::new();
+        let base_sequence = 2_000_000usize; // sort after widget spans
+
+        for (idx, annot_obj) in annots_arr.iter().enumerate() {
+            let annot_ref = match annot_obj {
+                Object::Reference(r) => *r,
+                _ => continue,
+            };
+            let dict = match self.load_object(annot_ref) {
+                Ok(obj) => match obj.as_dict() {
+                    Some(d) => d.clone(),
+                    None => continue,
+                },
+                Err(_) => continue,
+            };
+
+            let subtype = match dict.get("Subtype").and_then(|s| s.as_name()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let subtype_lc = subtype.to_ascii_lowercase();
+
+            // Skip Widget (handled by extract_widget_spans) and Popup (no independent content).
+            if subtype_lc == "widget" || subtype_lc == "popup" {
+                continue;
+            }
+
+            // Skip invisible / hidden / NoView annotations.
+            if let Some(Object::Integer(f)) = dict.get("F") {
+                if *f & (0x1 | 0x2 | 0x20) != 0 {
+                    continue;
+                }
+            }
+
+            // Only subtypes whose /Contents is rendered as visible page content.
+            // Per ISO 32000-1 §12.5.6.2 (Table 166), the /Contents key in ALL markup
+            // Per ISO 32000-1 §12.5.6.2 (Table 166), the /Contents of markup
+            // annotations — including Highlight, Underline, StrikeOut, Squiggly,
+            // Ink, Caret, FileAttachment, Redact, and geometric shapes (Line,
+            // Circle, Square, Polygon, PolyLine) — is popup/comment text written
+            // by a reviewer, NOT text displayed on the page. Only FreeText, Text
+            // (note icon), and Stamp annotations have /Contents that represents the
+            // annotation's visible label or overlay.
+            let has_contents = matches!(subtype_lc.as_str(), "text" | "freetext" | "stamp");
+            if !has_contents {
+                continue;
+            }
+
+            let text = match dict.get("Contents") {
+                Some(Object::String(s)) => {
+                    let decoded = Self::decode_pdf_text_string(s).trim().to_string();
+                    if decoded.is_empty() {
+                        continue;
+                    }
+                    decoded
+                },
+                _ => continue,
+            };
+
+            // Use /Rect as the annotation's bounding box.
+            // /Rect may be a direct array or an indirect reference to an array.
+            let rect_obj = match dict.get("Rect") {
+                Some(Object::Reference(r)) => match self.load_object(*r) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                },
+                Some(o) => o.clone(),
+                None => continue,
+            };
+            let rect = match rect_obj.as_array() {
+                Some(arr) if arr.len() == 4 => {
+                    let mut coords = [0.0f32; 4];
+                    let mut ok = true;
+                    for (i, item) in arr.iter().enumerate() {
+                        match item {
+                            Object::Integer(n) => coords[i] = *n as f32,
+                            Object::Real(f) => coords[i] = *f as f32,
+                            _ => {
+                                ok = false;
+                                break;
+                            },
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let x = coords[0].min(coords[2]);
+                    let y = coords[1].min(coords[3]);
+                    let w = (coords[2] - coords[0]).abs();
+                    let h = (coords[3] - coords[1]).abs();
+                    Rect {
+                        x,
+                        y,
+                        width: w.max(1.0),
+                        height: h.max(1.0),
+                    }
+                },
+                _ => continue,
+            };
+
+            spans.push(TextSpan {
+                artifact_type: None,
+                text,
+                bbox: rect,
+                font_name: String::new(),
+                font_size: 12.0,
+                font_weight: crate::layout::text_block::FontWeight::Normal,
+                is_italic: false,
+                is_monospace: false,
+                color: crate::layout::text_block::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                },
+                mcid: None,
+                sequence: base_sequence + idx,
+                split_boundary_before: false,
+                offset_semantic: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+            });
+        }
+
+        spans
+    }
+
     /// Walk /Parent chain to find inherited /Ff (field flags) value.
     fn resolve_inherited_ff(
         &self,
@@ -5876,33 +6544,26 @@ impl PdfDocument {
                         }
                     }
                 },
-                // Markup annotations (Highlight, Underline, StrikeOut, Squiggly)
-                // Per PDF Spec ISO 32000-1:2008 Section 12.5.6.10, markup annotations
-                // have a /Contents entry containing the text note associated with the markup.
-                "highlight" | "underline" | "strikeout" | "squiggly" => {
-                    if let Some(Object::String(s)) = dict.get("Contents") {
-                        let decoded = Self::decode_pdf_text_string(s);
-                        let trimmed = decoded.trim().to_string();
-                        if !trimmed.is_empty() {
-                            annot_texts.push(trimmed);
-                        }
-                    }
-                    // Also check /RC (Rich Content) for markup annotations
-                    // Per PDF Spec 12.5.6.10, /RC contains XHTML-formatted content
-                    if annot_texts.len() == len_before_annot {
-                        if let Some(Object::String(s)) = dict.get("RC") {
-                            // Strip XHTML tags to extract plain text
-                            let decoded = Self::decode_pdf_text_string(s);
-                            let plain = Self::strip_xhtml_tags(&decoded);
-                            let trimmed = plain.trim().to_string();
-                            if !trimmed.is_empty() {
-                                annot_texts.push(trimmed);
-                            }
-                        }
-                    }
+                // Geometric shape annotations — per §12.5.6.2, their /Contents is
+                // also popup/comment text, same as the markup group below.
+                "line" | "circle" | "square" | "polygon" | "polyline" => {
+                    // Skip — /Contents is popup comment text, not page content.
                 },
-                // Link annotations - Per PDF Spec 12.5.6.5
-                // Links may have /Contents describing the link target or purpose.
+                // Markup/comment annotations — per ISO 32000-1 §12.5.6.2 (Table 166),
+                // the /Contents of all these subtypes is popup/comment text written
+                // by a reviewer, NOT text displayed on the page. Exclude to avoid
+                // injecting user annotation notes into the body text stream.
+                // Per §12.5.6.2, all of these annotations' /Contents is popup/comment
+                // text (displayed in a pop-up window), not rendered page content.
+                // FileAttachment is explicitly in this category per §12.5.6.2 even
+                // though §12.5.6.15 calls it "descriptive text" — the pop-up semantics
+                // take precedence.
+                "highlight" | "underline" | "strikeout" | "squiggly" | "caret"
+                | "fileattachment" | "redact" | "ink" => {
+                    // Skip — /Contents is popup comment text, not page content.
+                },
+                // Link /Contents is an accessibility alternate description (§12.5.6.5).
+                // Treated as supplementary text on pages with no body content.
                 "link" => {
                     if let Some(Object::String(s)) = dict.get("Contents") {
                         let decoded = Self::decode_pdf_text_string(s);
@@ -5912,33 +6573,32 @@ impl PdfDocument {
                         }
                     }
                 },
-                // Popup annotations - Per PDF Spec 12.5.6.14
-                // Popup annotations display the /Contents of their /Parent annotation.
+                // Popup annotations — per §12.5.6.14 Table 183, the parent
+                // annotation's /Contents overrides the popup's own /Contents.
                 "popup" => {
-                    // Try own /Contents first
+                    // Try parent annotation's /Contents first (spec §12.5.6.14).
                     let mut got_text = false;
-                    if let Some(Object::String(s)) = dict.get("Contents") {
-                        let decoded = Self::decode_pdf_text_string(s);
-                        let trimmed = decoded.trim().to_string();
-                        if !trimmed.is_empty() {
-                            annot_texts.push(trimmed);
-                            got_text = true;
-                        }
-                    }
-                    // Fall back to parent annotation's /Contents
-                    if !got_text {
-                        if let Some(parent_ref) = dict.get("Parent").and_then(|o| o.as_reference())
-                        {
-                            if let Ok(parent_obj) = self.load_object(parent_ref) {
-                                if let Some(parent_dict) = parent_obj.as_dict() {
-                                    if let Some(Object::String(s)) = parent_dict.get("Contents") {
-                                        let decoded = Self::decode_pdf_text_string(s);
-                                        let trimmed = decoded.trim().to_string();
-                                        if !trimmed.is_empty() {
-                                            annot_texts.push(trimmed);
-                                        }
+                    if let Some(parent_ref) = dict.get("Parent").and_then(|o| o.as_reference()) {
+                        if let Ok(parent_obj) = self.load_object(parent_ref) {
+                            if let Some(parent_dict) = parent_obj.as_dict() {
+                                if let Some(Object::String(s)) = parent_dict.get("Contents") {
+                                    let decoded = Self::decode_pdf_text_string(s);
+                                    let trimmed = decoded.trim().to_string();
+                                    if !trimmed.is_empty() {
+                                        annot_texts.push(trimmed);
+                                        got_text = true;
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // Fall back to the popup's own /Contents only when parent has none.
+                    if !got_text {
+                        if let Some(Object::String(s)) = dict.get("Contents") {
+                            let decoded = Self::decode_pdf_text_string(s);
+                            let trimmed = decoded.trim().to_string();
+                            if !trimmed.is_empty() {
+                                annot_texts.push(trimmed);
                             }
                         }
                     }
@@ -6169,6 +6829,7 @@ impl PdfDocument {
     ///
     /// Per PDF Spec ISO 32000-1:2008 Section 12.7.3.4, /RC entries contain
     /// XHTML-formatted rich text. This method strips tags to produce plain text.
+    #[cfg(test)]
     fn strip_xhtml_tags(xhtml: &str) -> String {
         let mut result = String::with_capacity(xhtml.len());
         let mut inside_tag = false;
@@ -6434,15 +7095,7 @@ impl PdfDocument {
                         }
                     }
 
-                    for ch in span.text.chars() {
-                        if let Some(components) =
-                            crate::text::ligature_processor::get_ligature_components(ch)
-                        {
-                            text.push_str(components);
-                        } else {
-                            text.push(ch);
-                        }
-                    }
+                    Self::push_span_text(&mut text, span);
                     prev_span = Some(span);
                 }
             } else {
@@ -6450,6 +7103,9 @@ impl PdfDocument {
                     "Structure tree references MCID {} but no spans found with that MCID",
                     mcid
                 );
+                self.push_warning(format!(
+                    "page {page_index}: structure tree references MCID {mcid} but no content spans found — some text may be missing"
+                ));
             }
         }
 
@@ -6477,15 +7133,7 @@ impl PdfDocument {
                             text.push(' ');
                         }
                     }
-                    for ch in span.text.chars() {
-                        if let Some(components) =
-                            crate::text::ligature_processor::get_ligature_components(ch)
-                        {
-                            text.push_str(components);
-                        } else {
-                            text.push(ch);
-                        }
-                    }
+                    Self::push_span_text(&mut text, span);
                     prev_span = Some(span);
                 }
             }
@@ -6506,22 +7154,14 @@ impl PdfDocument {
                         text.push(' ');
                     }
                 }
-                // Expand ligature characters
-                for ch in span.text.chars() {
-                    if let Some(components) =
-                        crate::text::ligature_processor::get_ligature_components(ch)
-                    {
-                        text.push_str(components);
-                    } else {
-                        text.push(ch);
-                    }
-                }
+                Self::push_span_text(&mut text, span);
                 prev_span = Some(span);
             }
         }
 
-        // Append text from form fields and annotations
-        self.append_non_widget_annotation_text(page_index, &mut text);
+        // Annotation text is already included via annotation_content_spans() in
+        // extract_spans() — do NOT call append_non_widget_annotation_text() here
+        // (would cause double-emission of all annotation text).
 
         Ok(text)
     }
@@ -6619,15 +7259,7 @@ impl PdfDocument {
                         }
                     }
 
-                    for ch in span.text.chars() {
-                        if let Some(components) =
-                            crate::text::ligature_processor::get_ligature_components(ch)
-                        {
-                            text.push_str(components);
-                        } else {
-                            text.push(ch);
-                        }
-                    }
+                    Self::push_span_text(&mut text, span);
                     prev_span = Some(span);
                 }
             }
@@ -6654,15 +7286,7 @@ impl PdfDocument {
                             text.push(' ');
                         }
                     }
-                    for ch in span.text.chars() {
-                        if let Some(components) =
-                            crate::text::ligature_processor::get_ligature_components(ch)
-                        {
-                            text.push_str(components);
-                        } else {
-                            text.push(ch);
-                        }
-                    }
+                    Self::push_span_text(&mut text, span);
                     prev_span = Some(span);
                 }
             }
@@ -6688,21 +7312,14 @@ impl PdfDocument {
                         text.push(' ');
                     }
                 }
-                for ch in span.text.chars() {
-                    if let Some(components) =
-                        crate::text::ligature_processor::get_ligature_components(ch)
-                    {
-                        text.push_str(components);
-                    } else {
-                        text.push(ch);
-                    }
-                }
+                Self::push_span_text(&mut text, span);
                 prev_span = Some(span);
             }
         }
 
-        // Append text from form fields and annotations
-        self.append_non_widget_annotation_text(page_index, &mut text);
+        // Annotation text is already included via annotation_content_spans() in
+        // extract_spans() — do NOT call append_non_widget_annotation_text() here
+        // (would cause double-emission of all annotation text).
 
         Ok(text)
     }
@@ -6819,13 +7436,104 @@ impl PdfDocument {
             spans.retain(|span| !regions.iter().any(|r| r.intersects(&span.bbox)));
         }
 
+        // Append text from non-Widget annotations (/Subtype /Text, FreeText,
+        // Stamp, Highlight, etc.) that carry a /Contents entry.  These are not
+        // part of the page content stream so they are not picked up by the
+        // regular extractor.
+        spans.extend(self.annotation_content_spans(page_index));
+
         // Mark running headers/footers (untagged-PDF heuristic). Spans whose
         // normalized text recurs on >=50% of pages and sits near the top or
         // bottom of the page are flagged as artifacts so downstream filters
         // drop them.
         self.mark_running_artifact_spans(page_index, &mut spans)?;
 
+        // Normalize Unicode typographic spaces (U+2000–U+200B, U+202F, U+205F)
+        // to ASCII space.  Some PDF producers encode word separators as hair-space
+        // or thin-space variants in ToUnicode CMaps (e.g. justified text layouts);
+        // normalising here gives consistent word boundaries to every downstream
+        // consumer (extract_text, kreuzberg word-F1, etc.).
+        for span in &mut spans {
+            if span
+                .text
+                .chars()
+                .any(|c| matches!(c, '\u{2000}'..='\u{200B}' | '\u{202F}' | '\u{205F}'))
+            {
+                span.text = crate::converters::text_post_processor::TextPostProcessor
+                    ::normalize_unicode_spaces(&span.text)
+                    .into_owned();
+            }
+        }
+
+        // Apply char_widths boundary splits directly to span.text so that every
+        // downstream consumer (to_markdown, to_html, extract_text) sees the same
+        // word boundaries.  extract_text applies the same logic through push_span_text;
+        // after this normalization push_span_text sees a space at the boundary and
+        // becomes a no-op, so there is no double-application risk.
+        for span in &mut spans {
+            if let Some(split) = Self::char_widths_boundary_split(span) {
+                let mut t = String::with_capacity(span.text.len() + 1);
+                t.push_str(&span.text[..split]);
+                t.push(' ');
+                t.push_str(&span.text[split..]);
+                span.text = t;
+            }
+        }
+
         Ok(spans)
+    }
+
+    /// Return per-page font statistics for use in heading detection and layout analysis.
+    ///
+    /// [`crate::layout::PageFontStats`] contains:
+    /// - `dominant_em`: the mode font size weighted by character count — the body text "1 em"
+    /// - `dominant_line_height`: median baseline-to-baseline distance
+    /// - `dominant_char_width`: average character advance width
+    /// - `body_font_name`: name of the most-used font
+    ///
+    /// The primary use-case is heading detection in downstream tools: compare
+    /// `span.font_size / stats.dominant_em` against a threshold (e.g. 1.4×
+    /// for H2, 1.8× for H1) to classify large-font spans as headings without
+    /// depending on any hardcoded point sizes.
+    ///
+    /// ```ignore
+    /// let stats = doc.page_font_stats(0)?;
+    /// let spans = doc.extract_spans(0)?;
+    /// for span in &spans {
+    ///     let ratio = span.font_size / stats.dominant_em;
+    ///     if ratio >= 1.8 { println!("H1: {}", span.text); }
+    ///     else if ratio >= 1.4 { println!("H2: {}", span.text); }
+    /// }
+    /// ```
+    pub fn page_font_stats(&self, page_index: usize) -> Result<crate::layout::PageFontStats> {
+        let spans = self.extract_spans(page_index)?;
+        Ok(crate::layout::PageFontStats::from_spans(&spans))
+    }
+
+    /// Return all extraction warnings accumulated since this document was opened.
+    ///
+    /// Warnings are recorded when silent fallbacks occur during text extraction
+    /// (e.g., missing ToUnicode CMap, font not found, malformed structure tree).
+    /// They do NOT consume the warning list — use [`Self::take_warnings`] to drain it.
+    ///
+    /// This API makes previously invisible extraction degradations programmatically
+    /// observable without requiring callers to hook into the `log` crate.
+    pub fn warnings(&self) -> Vec<String> {
+        self.accumulated_warnings.lock_or_recover().clone()
+    }
+
+    /// Drain and return all accumulated extraction warnings, clearing the list.
+    ///
+    /// After this call, [`Self::warnings`] returns an empty `Vec` until new warnings
+    /// are generated. Useful for incremental processing pipelines that want to
+    /// inspect warnings on a per-page or per-operation basis.
+    pub fn take_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut *self.accumulated_warnings.lock_or_recover())
+    }
+
+    /// Record an extraction warning. Called internally when a silent fallback occurs.
+    pub(crate) fn push_warning(&self, msg: impl Into<String>) {
+        self.accumulated_warnings.lock_or_recover().push(msg.into());
     }
 
     /// Heuristic: does this page have two or more vertical text columns?
@@ -7709,6 +8417,11 @@ impl PdfDocument {
         // Walk spans in canonical reading order, clustering chars within each span
         // into words. Since spans come pre-ordered, a flat iteration suffices —
         // no block-by-block partition is needed.
+        //
+        // Track word indices where the source span had split_boundary_before = true.
+        // The post-processing merge must not cross these boundaries (table cells, columns).
+        let mut split_boundary_word_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
         let mut words = Vec::new();
         for span in &spans {
             let span_chars = span.to_chars();
@@ -7720,6 +8433,11 @@ impl PdfDocument {
             // this is much safer than global character clustering.
             let clusters =
                 clustering::cluster_chars_into_words(&span_chars, params.word_gap_threshold);
+
+            // Record split boundary: the first word created from this span is a hard
+            // boundary when split_boundary_before = true (e.g. table cell boundary).
+            let first_word_idx = words.len();
+            let is_split_boundary = span.split_boundary_before;
 
             for cluster_indices in clusters {
                 let cluster_chars: Vec<_> = cluster_indices
@@ -7742,9 +8460,58 @@ impl PdfDocument {
                     words.push(Word::from_chars(current_word_chars));
                 }
             }
+
+            // Only mark the boundary if at least one word was created for this span.
+            if is_split_boundary && words.len() > first_word_idx {
+                split_boundary_word_indices.insert(first_word_idx);
+            }
         }
 
-        Ok(words)
+        // Post-processing: merge adjacent words whose spans abut or overlap on
+        // the same line.  PDFs (especially tagged CJK documents) sometimes encode
+        // typographically-adjacent glyphs as separate marked-content runs, e.g.
+        // "Q" and "（peu/d）" with a gap of -0.18 points.  Without merging these
+        // remain separate tokens and never match the ground-truth "Q（peu/d）".
+        //
+        // Merge condition: same line (y_diff ≤ 0.5 × max line height) AND
+        // horizontal gap ≤ 0.15 × font_size (same threshold as should_insert_space).
+        // Skip merge when the current word index is a split boundary.
+        let mut merged: Vec<Word> = Vec::with_capacity(words.len());
+        for (idx, word) in words.into_iter().enumerate() {
+            if !split_boundary_word_indices.contains(&idx) {
+                if let Some(prev) = merged.last_mut() {
+                    let gap = word.bbox.x - (prev.bbox.x + prev.bbox.width);
+                    let y_diff = (word.bbox.y - prev.bbox.y).abs();
+                    let line_h = prev.bbox.height.max(word.bbox.height);
+                    let font_size = prev.avg_font_size.max(word.avg_font_size).max(1.0);
+                    if y_diff <= line_h * 0.5 && gap <= font_size * 0.15 {
+                        // Incremental merge — O(k) per merge, O(total_chars) overall.
+                        // Avoids the O(n²) clone+from_chars pattern that caused
+                        // catastrophic slowdown on TOC dot-leader pages.
+                        let prev_n = prev.chars.len() as f32;
+                        let word_n = word.chars.len() as f32;
+                        prev.bbox = prev.bbox.union(&word.bbox);
+                        prev.avg_font_size = (prev.avg_font_size * prev_n
+                            + word.avg_font_size * word_n)
+                            / (prev_n + word_n);
+                        if word_n > prev_n {
+                            prev.dominant_font = word.dominant_font;
+                        }
+                        prev.is_bold |= word.is_bold;
+                        prev.is_italic |= word.is_italic;
+                        if prev.mcid != word.mcid {
+                            prev.mcid = None;
+                        }
+                        prev.text.push_str(&word.text);
+                        prev.chars.extend(word.chars);
+                        continue;
+                    }
+                }
+            }
+            merged.push(word);
+        }
+
+        Ok(merged)
     }
 
     /// Extract text lines from a page.
@@ -7990,7 +8757,6 @@ impl PdfDocument {
     /// ```
     pub fn apply_intelligent_text_processing(&self, mut spans: Vec<TextSpan>) -> Vec<TextSpan> {
         use crate::converters::text_post_processor::TextPostProcessor;
-        use crate::text::ligature_processor::get_ligature_components;
 
         for span in &mut spans {
             // Step 1: Detect if this is OCR text (from our OCR or known OCR engines)
@@ -7998,19 +8764,10 @@ impl PdfDocument {
                 || span.font_name.to_lowercase().contains("tesseract")
                 || span.font_name.to_lowercase().contains("abbyy");
 
-            // Step 2: Expand ligatures in text
-            let mut expanded = String::with_capacity(span.text.len() * 2);
-            for ch in span.text.chars() {
-                if let Some(components) = get_ligature_components(ch) {
-                    expanded.push_str(components);
-                } else {
-                    expanded.push(ch);
-                }
-            }
-
-            // Step 3: Apply text post-processing pipeline
-            // (hyphenation, whitespace, special char spacing)
-            span.text = TextPostProcessor::process(&expanded);
+            // Step 2: Apply text post-processing pipeline
+            // (hyphenation, whitespace, special char spacing).
+            // Ligature characters from the font's ToUnicode map are preserved as-is.
+            span.text = TextPostProcessor::process(&span.text);
 
             // Step 4: Additional OCR-specific cleanup if needed
             if is_ocr {
@@ -8077,11 +8834,9 @@ impl PdfDocument {
     /// The content stream contains PDF operators that define the page's appearance.
     pub fn get_page_content_data(&self, page_index: usize) -> Result<Vec<u8>> {
         {
-            let cache = self.page_content_cache.lock_or_recover();
-            if let Some((cached_page, data)) = cache.as_ref() {
-                if *cached_page == page_index {
-                    return Ok(data.as_ref().clone());
-                }
+            let mut cache = self.page_content_cache.lock_or_recover();
+            if let Some(data) = cache.get(&page_index) {
+                return Ok(data.as_ref().clone());
             }
         }
 
@@ -8190,8 +8945,9 @@ impl PdfDocument {
             String::from_utf8_lossy(&content_data)
         );
 
-        *self.page_content_cache.lock_or_recover() =
-            Some((page_index, std::sync::Arc::new(content_data.clone())));
+        self.page_content_cache
+            .lock_or_recover()
+            .insert(page_index, std::sync::Arc::new(content_data.clone()));
 
         Ok(content_data)
     }
@@ -8915,20 +9671,24 @@ impl PdfDocument {
     }
 
     /// Extract text from a specific rectangular region of a page (v0.3.14).
+    ///
+    /// Only spans whose bounding boxes match `region` under `mode` are kept;
+    /// the retained spans are assembled through the full text pipeline
+    /// (reading order, tables, line breaks) so the output matches the
+    /// quality of [`Self::extract_text`]. Calling this with a region that covers
+    /// the whole page is equivalent to [`Self::extract_text`].
     pub fn extract_text_in_rect(
         &self,
         page_index: usize,
         region: crate::geometry::Rect,
         mode: crate::layout::RectFilterMode,
     ) -> Result<String> {
-        use crate::layout::SpatialCollectionFiltering;
-        let words = self.extract_words(page_index)?;
-        let filtered = words.filter_by_rect(&region, mode);
-        Ok(filtered
-            .iter()
-            .map(|w| w.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" "))
+        let options = crate::converters::ConversionOptions {
+            extract_tables: true,
+            include_region: Some((region, mode)),
+            ..Default::default()
+        };
+        self.extract_text_with_options(page_index, &options)
     }
 
     /// Extract words from a specific rectangular region of a page (v0.3.14).
@@ -8965,6 +9725,71 @@ impl PdfDocument {
         use crate::layout::SpatialCollectionFiltering;
         let spans = self.extract_spans(page_index)?;
         Ok(spans.filter_by_rect(&region, mode))
+    }
+
+    /// Extract text from a page excluding specific rectangular regions.
+    ///
+    /// The excluded spans are removed before the full text-assembly pipeline
+    /// runs, so the output has the same structure — line breaks, tables,
+    /// reading order — as [`Self::extract_text`]. Calling this with an empty
+    /// `exclude` slice is equivalent to [`Self::extract_text`].
+    ///
+    /// `mode` controls the overlap rule:
+    /// - [`crate::layout::RectFilterMode::Intersects`] (default): drop any span with *any* overlap
+    /// - [`crate::layout::RectFilterMode::FullyContained`]: drop only spans lying entirely inside
+    /// - `RectFilterMode::MinOverlap(t)`: drop spans where at least fraction `t`
+    ///   of the *span's* area overlaps an excluded region
+    ///
+    /// For Tagged PDFs the extractor already honours `/Artifact` marked-content
+    /// (PDF spec §14.8.2.2). This method provides the same capability for
+    /// untagged PDFs where spatial coordinates are the only available signal.
+    /// Exclusion is unconditional: spans inside a region are dropped regardless
+    /// of their structure-tree role.
+    pub fn extract_text_excluding_rects(
+        &self,
+        page_index: usize,
+        exclude: &[crate::geometry::Rect],
+        mode: crate::layout::RectFilterMode,
+    ) -> Result<String> {
+        let options = crate::converters::ConversionOptions {
+            extract_tables: true,
+            exclude_regions: exclude.to_vec(),
+            exclude_regions_mode: mode,
+            ..Default::default()
+        };
+        self.extract_text_with_options(page_index, &options)
+    }
+
+    /// Extract words from a page excluding specific rectangular regions.
+    ///
+    /// See [`Self::extract_text_excluding_rects`] for a description of `exclude` and `mode`.
+    /// Returns the low-level [`crate::layout::Word`] stream; use [`Self::extract_text_excluding_rects`]
+    /// for fully-assembled text with line breaks and tables.
+    pub fn extract_words_excluding_rects(
+        &self,
+        page_index: usize,
+        exclude: &[crate::geometry::Rect],
+        mode: crate::layout::RectFilterMode,
+    ) -> Result<Vec<crate::layout::Word>> {
+        use crate::layout::SpatialCollectionFiltering;
+        let words = self.extract_words(page_index)?;
+        Ok(words.exclude_rects(exclude, mode))
+    }
+
+    /// Extract text spans from a page excluding specific rectangular regions.
+    ///
+    /// See [`Self::extract_text_excluding_rects`] for a description of `exclude` and `mode`.
+    /// Returns raw [`crate::layout::TextSpan`] objects with bounding boxes and font metadata;
+    /// use [`Self::extract_text_excluding_rects`] for fully-assembled text output.
+    pub fn extract_spans_excluding_rects(
+        &self,
+        page_index: usize,
+        exclude: &[crate::geometry::Rect],
+        mode: crate::layout::RectFilterMode,
+    ) -> Result<Vec<crate::layout::TextSpan>> {
+        use crate::layout::SpatialCollectionFiltering;
+        let spans = self.extract_spans(page_index)?;
+        Ok(spans.exclude_rects(exclude, mode))
     }
 
     /// Extract rectangles from a specific rectangular region of a page (v0.3.14).
@@ -9157,6 +9982,33 @@ impl PdfDocument {
         } else {
             Ok(obj.clone())
         }
+    }
+
+    /// Look up a font from the per-document `font_cache`, parsing and inserting
+    /// on a cache miss.  Used by the page renderer so that `FontInfo::from_dict`
+    /// (which decodes widths, CID maps, ToUnicode CMaps, and extracts embedded
+    /// font bytes) is called at most once per PDF object reference, even when
+    /// multiple pages share the same font resources.
+    #[cfg(feature = "rendering")]
+    pub fn get_or_load_font_for_rendering(
+        &self,
+        font_obj: &Object,
+    ) -> Result<Arc<crate::fonts::FontInfo>> {
+        if let Some(font_ref) = font_obj.as_reference() {
+            let cached = self.font_cache.lock_or_recover().get(&font_ref).cloned();
+            if let Some(arc) = cached {
+                return Ok(arc);
+            }
+        }
+        let resolved = self.resolve_object(font_obj)?;
+        let info = crate::fonts::FontInfo::from_dict(&resolved, self)?;
+        let arc = Arc::new(info);
+        if let Some(font_ref) = font_obj.as_reference() {
+            self.font_cache
+                .lock_or_recover()
+                .insert(font_ref, Arc::clone(&arc));
+        }
+        Ok(arc)
     }
 
     /// Compute a cheap content-based font identity hash from a loaded font object.
@@ -12550,6 +13402,156 @@ mod tests {
     }
 
     // ========================================================================
+    // is_column_spanning_decimal / push_span_text tests (nougat_018 fix)
+    // ========================================================================
+
+    fn make_decimal_span(
+        text: &str,
+        char_widths: Vec<f32>,
+        bbox_w: f32,
+        font_size: f32,
+    ) -> TextSpan {
+        TextSpan {
+            text: text.to_string(),
+            bbox: crate::geometry::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: bbox_w,
+                height: font_size,
+            },
+            font_name: "F1".to_string(),
+            font_size,
+            font_weight: crate::layout::FontWeight::Normal,
+            is_italic: false,
+            is_monospace: false,
+            color: crate::layout::Color::new(0.0, 0.0, 0.0),
+            mcid: None,
+            sequence: 0,
+            split_boundary_before: false,
+            offset_semantic: false,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 100.0,
+            primary_detected: false,
+            artifact_type: None,
+            char_widths,
+        }
+    }
+
+    #[test]
+    fn test_column_spanning_decimal_wide_bbox() {
+        // "1.10": 4 chars, cw=[3.98], expected=15.92, gap=9.8 > fs(7.0) → split
+        let span = make_decimal_span("1.10", vec![3.9811199], 25.72, 7.0);
+        assert!(PdfDocument::is_column_spanning_decimal(&span));
+    }
+
+    #[test]
+    fn test_column_spanning_decimal_5char_span() {
+        // "12.11": 5 chars, cw=[3.98,3.98], expected=19.91, gap=7.73 > fs(7.0) → split
+        let span = make_decimal_span("12.11", vec![3.9811199, 3.9811199], 27.64, 7.0);
+        assert!(PdfDocument::is_column_spanning_decimal(&span));
+    }
+
+    #[test]
+    fn test_column_spanning_decimal_normal_bbox() {
+        // "1.5" with 3 entries matching 3 chars; bbox_w = expected → gap ≈ 0 → no split
+        let span = make_decimal_span("1.5", vec![3.0, 3.0, 3.0], 9.0, 7.0);
+        assert!(!PdfDocument::is_column_spanning_decimal(&span));
+    }
+
+    #[test]
+    fn test_column_spanning_decimal_non_digit() {
+        // "hello.world" — letters, not digits → no split
+        let span = make_decimal_span("hello.world", vec![], 60.0, 12.0);
+        assert!(!PdfDocument::is_column_spanning_decimal(&span));
+    }
+
+    #[test]
+    fn test_column_spanning_decimal_multiple_dots() {
+        // "1.2.3" — two dots → no split
+        let span = make_decimal_span("1.2.3", vec![3.0], 25.0, 7.0);
+        assert!(!PdfDocument::is_column_spanning_decimal(&span));
+    }
+
+    #[test]
+    fn test_push_span_text_splits_wide_decimal() {
+        let span = make_decimal_span("1.10", vec![3.9811199], 25.72, 7.0);
+        let mut out = String::new();
+        PdfDocument::push_span_text(&mut out, &span);
+        assert_eq!(out, "1 10");
+    }
+
+    #[test]
+    fn test_push_span_text_leaves_normal_decimal() {
+        let span = make_decimal_span("3.14", vec![4.0, 4.0, 4.0, 4.0], 16.0, 12.0);
+        let mut out = String::new();
+        PdfDocument::push_span_text(&mut out, &span);
+        assert_eq!(out, "3.14");
+    }
+
+    // ========================================================================
+    // char_widths_boundary_split tests (pdfa_004 CID-font merge fix)
+    // ========================================================================
+
+    #[test]
+    fn test_cw_boundary_split_theorem_number() {
+        // "Theorem1.7": 10 chars, 7 widths → split before '1'
+        let span =
+            make_decimal_span("Theorem1.7", vec![11.2, 8.9, 7.4, 8.1, 6.6, 7.4, 13.4], 83.8, 14.3);
+        let result = PdfDocument::char_widths_boundary_split(&span);
+        assert_eq!(result, Some(7)); // byte 7 = '1'
+    }
+
+    #[test]
+    fn test_cw_boundary_split_let_capital() {
+        // "LetC": 4 chars, 3 widths — lower→upper boundary → split at 'C'
+        // (represents two CID text runs "Let" + "C" concatenated)
+        let span = make_decimal_span("LetC", vec![7.3, 5.2, 4.5], 26.7, 12.0);
+        let result = PdfDocument::char_widths_boundary_split(&span);
+        assert_eq!(result, Some(3)); // byte 3 = 'C'
+    }
+
+    #[test]
+    fn test_cw_boundary_no_split_already_space() {
+        // "Theorem 1.1": 7 widths, char at idx 7 is space → no split
+        let span =
+            make_decimal_span("Theorem 1.1", vec![9.3, 7.5, 6.1, 6.7, 5.5, 6.1, 11.2], 80.0, 12.0);
+        assert!(PdfDocument::char_widths_boundary_split(&span).is_none());
+    }
+
+    #[test]
+    fn test_cw_boundary_no_split_matching_count() {
+        // "hello" with 5 widths: no mismatch
+        let span = make_decimal_span("hello", vec![5.0, 5.0, 5.0, 5.0, 5.0], 25.0, 12.0);
+        assert!(PdfDocument::char_widths_boundary_split(&span).is_none());
+    }
+
+    #[test]
+    fn test_cw_boundary_no_split_nonascii_boundary() {
+        // "Marysia Prus-Gł": boundary char is 'ł' (non-ASCII) → no split
+        let span = make_decimal_span("Marysia Prus-Gł", vec![5.0; 14], 80.0, 12.0);
+        assert!(PdfDocument::char_widths_boundary_split(&span).is_none());
+    }
+
+    #[test]
+    fn test_push_span_text_splits_let_capital() {
+        // Lower→upper boundary: "LetC" splits to "Let C" (space inserted at 'C')
+        let span = make_decimal_span("LetC", vec![7.3, 5.2, 4.5], 26.7, 12.0);
+        let mut out = String::new();
+        PdfDocument::push_span_text(&mut out, &span);
+        assert_eq!(out, "Let C");
+    }
+
+    #[test]
+    fn test_push_span_text_splits_theorem_number() {
+        let span =
+            make_decimal_span("Theorem1.7", vec![11.2, 8.9, 7.4, 8.1, 6.6, 7.4, 13.4], 83.8, 14.3);
+        let mut out = String::new();
+        PdfDocument::push_span_text(&mut out, &span);
+        assert_eq!(out, "Theorem 1.7");
+    }
+
+    // ========================================================================
     // filter_leaked_metadata tests
     // ========================================================================
 
@@ -13638,13 +14640,20 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_intelligent_text_processing_ligature_expansion() {
+    fn test_apply_intelligent_text_processing_ligature_preserved() {
+        // Since v0.3.46 the pipeline preserves Unicode ligature characters that come
+        // from the font's ToUnicode map (U+FB01 = ﬁ). Expanding them to plain "fi"
+        // caused Jaccard mismatches against ground-truth corpora that keep ligatures.
         let pdf = build_minimal_pdf(b"");
         let doc = PdfDocument::from_bytes(pdf).unwrap();
-        let spans = vec![make_test_span("\u{FB01}nd", 0.0, 0.0, 50.0, 12.0)]; // fi-ligature + "nd" = "find"
+        let spans = vec![make_test_span("\u{FB01}nd", 0.0, 0.0, 50.0, 12.0)]; // ﬁnd
         let result = doc.apply_intelligent_text_processing(spans);
         assert_eq!(result.len(), 1);
-        assert!(result[0].text.contains("find"));
+        assert!(
+            result[0].text.contains('\u{FB01}'),
+            "ﬁ must be preserved, got: {:?}",
+            result[0].text
+        );
     }
 
     // ========================================================================
@@ -14333,6 +15342,160 @@ mod tests {
     }
 
     // ========================================================================
+    // extract_words: adjacent-span merging tests (issue-336 regression)
+    // ========================================================================
+
+    /// Adjacent-span merging: two single-character spans with zero horizontal gap
+    /// must produce one merged word, not two separate words.
+    ///
+    /// This exercises the post-processing pass in extract_words_inner that merges
+    /// spans whose bboxes abut (gap ≤ 0.15 × font_size) on the same line.
+    #[test]
+    fn test_extract_words_adjacent_spans_merged() {
+        // Build a minimal one-page PDF whose content stream places "Q" then "（"
+        // as two consecutive Tj operations with no word space between them.
+        // We build the PDF bytes manually so we control the exact glyph positions.
+        use crate::ffi::{
+            free_bytes, pdf_document_builder_build, pdf_document_builder_create,
+            pdf_document_builder_free, pdf_document_builder_letter_page, pdf_page_builder_at,
+            pdf_page_builder_done, pdf_page_builder_font, pdf_page_builder_text,
+        };
+        use std::ffi::CString;
+
+        unsafe {
+            let mut ec: i32 = -1;
+            let builder = pdf_document_builder_create(&mut ec);
+            assert_eq!(ec, 0);
+            let page = pdf_document_builder_letter_page(builder, &mut ec);
+            assert_eq!(ec, 0);
+            pdf_page_builder_font(page, CString::new("Helvetica").unwrap().as_ptr(), 12.0, &mut ec);
+            assert_eq!(ec, 0);
+            // Place "Q（peu/d）" as a single text run — this will be one span.
+            // extract_words should produce exactly one word.
+            pdf_page_builder_at(page, 100.0, 500.0, &mut ec);
+            assert_eq!(ec, 0);
+            let t = CString::new("Q（peu/d）").unwrap();
+            pdf_page_builder_text(page, t.as_ptr(), &mut ec);
+            assert_eq!(ec, 0);
+            pdf_page_builder_done(page, &mut ec);
+            assert_eq!(ec, 0);
+
+            let mut pdf_len: usize = 0;
+            let pdf_ptr = pdf_document_builder_build(builder, &mut pdf_len, &mut ec);
+            assert_eq!(ec, 0);
+            let bytes = std::slice::from_raw_parts(pdf_ptr as *const u8, pdf_len).to_vec();
+            free_bytes(pdf_ptr);
+            pdf_document_builder_free(builder);
+
+            let doc = PdfDocument::from_bytes(bytes).unwrap();
+            let words = doc.extract_words(0).unwrap();
+            // All characters in a single Tj → should be one word
+            let combined: String = words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                words.iter().any(|w| w.text.contains("peu/d")),
+                "the text 'peu/d' must appear in some word, got: {combined:?}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Ligature preservation tests (nougat_040 regression)
+    // ========================================================================
+
+    /// Helper: build a minimal PDF whose single character maps to U+FB01 (LATIN SMALL
+    /// LIGATURE FI) via a ToUnicode CMap.  This exercises the path where pdfium hands us
+    /// U+FB01 from the font's ToUnicode map and we must NOT expand it to "fi".
+    fn build_ligature_fi_pdf() -> Vec<u8> {
+        let cmap = "/CIDInit /ProcSet findresource begin\n\
+                    12 dict begin\n\
+                    begincmap\n\
+                    /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+                    /CMapName /Adobe-Identity-UCS def\n\
+                    /CMapType 2 def\n\
+                    1 begincodespacerange\n\
+                    <01> <01>\n\
+                    endcodespacerange\n\
+                    1 beginbfchar\n\
+                    <01> <FB01>\n\
+                    endbfchar\n\
+                    endcmap\n\
+                    CMapName currentdict /CMap defineresource pop\n\
+                    end\n\
+                    end\n";
+
+        // Content stream: BT /F1 12 Tf 100 500 Td (\001) Tj ET
+        let content = "BT /F1 12 Tf 100 500 Td (\\001) Tj ET\n";
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut off: Vec<usize> = vec![0];
+
+        out.extend_from_slice(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n");
+
+        macro_rules! push {
+            ($body:expr) => {{
+                off.push(out.len());
+                let id = off.len() - 1;
+                out.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", id, $body).as_bytes());
+            }};
+        }
+
+        push!("<< /Type /Catalog /Pages 2 0 R >>"); // 1
+        push!("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"); // 2
+        push!(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        )); // 3
+        push!(format!(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding << /Type /Encoding /Differences [1 /fi] >> \
+             /ToUnicode 6 0 R >>"
+        )); // 4
+        push!(format!("<< /Length {} >>\nstream\n{}endstream", content.len(), content)); // 5
+        push!(format!("<< /Length {} >>\nstream\n{}endstream", cmap.len(), cmap)); // 6
+
+        let xref_offset = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", off.len()).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for &o in &off[1..] {
+            out.extend_from_slice(format!("{:010} 00000 n \n", o).as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                off.len(),
+                xref_offset
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// A ToUnicode CMap that maps char 0x01 → U+FB01 (ﬁ) must produce the
+    /// ligature character in extract_text output — NOT the expanded "fi".
+    ///
+    /// Before the fix, `extract_text` unconditionally calls
+    /// `get_ligature_components(ﬁ)` → "fi", discarding the font's own
+    /// ToUnicode intent.  After the fix the ligature char is preserved.
+    #[test]
+    fn test_ligature_fi_preserved_in_extract_text() {
+        let pdf = build_ligature_fi_pdf();
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+        let text = doc.extract_text(0).unwrap();
+        assert!(
+            text.contains('\u{FB01}'),
+            "U+FB01 (ﬁ) must be preserved in extracted text; got: {text:?}"
+        );
+        assert!(
+            !text.contains("fi") || text.contains('\u{FB01}'),
+            "must not expand ﬁ → fi; got: {text:?}"
+        );
+    }
+
+    // ========================================================================
     // NEW COVERAGE TESTS — Batch 8: find_references
     // ========================================================================
 
@@ -14506,12 +15669,14 @@ mod tests {
 
     #[test]
     fn test_annotation_highlight() {
+        // Highlight annotation /Contents is a user comment on the highlighted
+        // text — it is NOT page content and must NOT appear in extract_text output.
         let annot =
             b"4 0 obj\n<< /Type /Annot /Subtype /Highlight /Contents (Highlighted) >>\nendobj\n"
                 .to_vec();
         let pdf = build_pdf_with_annotations(vec![(4, annot)]);
         let doc = PdfDocument::from_bytes(pdf).unwrap();
-        assert!(doc.extract_text(0).unwrap().contains("Highlighted"));
+        assert!(!doc.extract_text(0).unwrap().contains("Highlighted"));
     }
 
     #[test]
@@ -15063,12 +16228,17 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_intelligent_text_processing_fl_ligature() {
+    fn test_apply_intelligent_text_processing_fl_ligature_preserved() {
+        // Same as ﬁ: ﬂ (U+FB02) must be preserved, not expanded to "fl".
         let pdf = build_minimal_pdf(b"");
         let doc = PdfDocument::from_bytes(pdf).unwrap();
-        let spans = vec![make_test_span("\u{FB02}oor", 0.0, 0.0, 50.0, 12.0)];
+        let spans = vec![make_test_span("\u{FB02}oor", 0.0, 0.0, 50.0, 12.0)]; // ﬂoor
         let result = doc.apply_intelligent_text_processing(spans);
-        assert!(result[0].text.contains("floor"));
+        assert!(
+            result[0].text.contains('\u{FB02}'),
+            "ﬂ must be preserved, got: {:?}",
+            result[0].text
+        );
     }
 
     #[test]
@@ -15964,5 +17134,158 @@ mod tests {
         );
 
         assert!(PdfDocument::contains_rect_with_tolerance(&table, &inside, 0.1));
+    }
+
+    /// Regression test for #484 (pdfa_036): span filtering must use per-cell
+    /// bboxes, not the coarser outer table bbox.
+    ///
+    /// Before the fix, `span_in_table` filtered by `table.bbox`, which could
+    /// be wider than the union of the actual cell bboxes. Paragraph text that
+    /// happened to fall inside the table's outer bbox was silently dropped even
+    /// though no cell claimed it, causing content loss (the "(HLA)/(KSL)"
+    /// paragraph in pdfa_036 disappeared).
+    ///
+    /// After the fix, only spans inside at least one *cell* bbox are removed
+    /// from the flow. Spans inside the outer table bbox but outside all cells
+    /// (i.e. in a gap or margin) are preserved.
+    #[test]
+    fn cell_bbox_filter_preserves_span_in_outer_bbox_gap() {
+        use crate::geometry::Rect;
+        use crate::structure::table_extractor::{Table, TableCell, TableRow};
+
+        // A table whose outer bbox is [0, 0] – [200, 100].
+        // Two non-adjacent cells leave a horizontal gap at x=90..110 — that
+        // gap is inside the outer bbox but not inside any cell.
+        let mut table = Table::new();
+        let mut row = TableRow::new(false);
+        row.cells.push(TableCell {
+            text: "left".to_string(),
+            spans: vec![],
+            colspan: 1,
+            rowspan: 1,
+            mcids: vec![],
+            bbox: Some(Rect::new(0.0, 0.0, 90.0, 100.0)),
+            is_header: false,
+        });
+        row.cells.push(TableCell {
+            text: "right".to_string(),
+            spans: vec![],
+            colspan: 1,
+            rowspan: 1,
+            mcids: vec![],
+            bbox: Some(Rect::new(110.0, 0.0, 90.0, 100.0)),
+            is_header: false,
+        });
+        table.add_row(row);
+        table.bbox = Some(Rect::new(0.0, 0.0, 200.0, 100.0));
+
+        const TOL: f32 = 0.1;
+
+        // A span sitting inside the left cell → should be "in table".
+        let span_cell = Rect::new(10.0, 10.0, 50.0, 20.0);
+        let in_any_cell = table.rows.iter().any(|r| {
+            r.cells.iter().any(|c| {
+                c.bbox
+                    .is_some_and(|b| PdfDocument::contains_rect_with_tolerance(&b, &span_cell, TOL))
+            })
+        });
+        assert!(in_any_cell, "span inside a cell bbox must be identified as in-table");
+
+        // A span in the gap (x=95..105) — inside outer table bbox, outside all cells.
+        let span_gap = Rect::new(95.0, 10.0, 10.0, 20.0);
+
+        // 1. Outer-bbox filter (the OLD, incorrect approach) would classify it as in-table.
+        let in_outer_bbox =
+            PdfDocument::contains_rect_with_tolerance(&table.bbox.unwrap(), &span_gap, TOL);
+        assert!(
+            in_outer_bbox,
+            "gap span must be inside the outer table bbox (precondition for the bug to trigger)"
+        );
+
+        // 2. Cell-bbox filter (the NEW, correct approach) must NOT classify it as in-table.
+        let in_any_cell_gap = table.rows.iter().any(|r| {
+            r.cells.iter().any(|c| {
+                c.bbox
+                    .is_some_and(|b| PdfDocument::contains_rect_with_tolerance(&b, &span_gap, TOL))
+            })
+        });
+        assert!(
+            !in_any_cell_gap,
+            "gap span must NOT be inside any cell bbox — cell-bbox filter must preserve it"
+        );
+    }
+
+    #[test]
+    fn reorder_same_line_runs_preserves_disjoint_x_rows() {
+        use crate::geometry::Rect;
+        use crate::layout::TextSpan;
+
+        // Two rows close enough in Y to pass the existing same_line_threshold:
+        // Δy = 4.5 and fs = 10, so threshold = 5.0.
+        // They are disjoint in X (gap of 225pt = 22.5 * fs, well over the
+        // SAME_LINE_REORDER_MAX_GAP_FACTOR = 3.0 ceiling). The helper must
+        // not X-sort them into [skersey, VerDate]; it must preserve the
+        // row-aware order.
+        let mut spans = vec![
+            TextSpan {
+                text: "VerDate".to_string(),
+                bbox: Rect::new(350.0, 200.0, 85.0, 10.0),
+                font_size: 10.0,
+                sequence: 0,
+                ..Default::default()
+            },
+            TextSpan {
+                text: "skersey".to_string(),
+                bbox: Rect::new(50.0, 195.5, 75.0, 10.0),
+                font_size: 10.0,
+                sequence: 1,
+                ..Default::default()
+            },
+        ];
+
+        PdfDocument::reorder_same_line_runs(&mut spans);
+
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["VerDate", "skersey"]);
+    }
+
+    #[test]
+    fn reorder_same_line_runs_orders_suffix_superscript_by_x() {
+        use crate::geometry::Rect;
+        use crate::layout::TextSpan;
+
+        // Row-aware/Y-desc order can put the superscript first because it
+        // sits higher. The tentative X-gap validation must not reject this
+        // legitimate mixed-baseline run; the X-sorted gaps are 15pt and 0pt
+        // at max_fs=14, both well under 3.0 * 14 = 42. Final order should
+        // be normal left-to-right text.
+        let mut spans = vec![
+            TextSpan {
+                text: "th".to_string(),
+                bbox: Rect::new(180.0, 205.0, 10.0, 10.0),
+                font_size: 10.0,
+                sequence: 0,
+                ..Default::default()
+            },
+            TextSpan {
+                text: "September".to_string(),
+                bbox: Rect::new(100.0, 200.0, 50.0, 14.0),
+                font_size: 14.0,
+                sequence: 1,
+                ..Default::default()
+            },
+            TextSpan {
+                text: "11".to_string(),
+                bbox: Rect::new(165.0, 200.0, 15.0, 14.0),
+                font_size: 14.0,
+                sequence: 2,
+                ..Default::default()
+            },
+        ];
+
+        PdfDocument::reorder_same_line_runs(&mut spans);
+
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["September", "11", "th"]);
     }
 }

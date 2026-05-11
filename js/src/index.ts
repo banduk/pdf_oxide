@@ -284,9 +284,22 @@ export interface RenderOptions {
   jpegQuality?: number;
 }
 
+/**
+ * Raw premultiplied RGBA8888 pixel buffer. Layout: row-major, top-left origin,
+ * 4 bytes (R,G,B,A) per pixel, `data.length === width * height * 4`.
+ * Alpha is premultiplied (PDF spec §11 transparency model).
+ */
+export interface RgbaPixmap {
+  data: Buffer;
+  width: number;
+  height: number;
+}
+
 class PdfDocumentImpl {
   private _handle: any;
   private _closed = false;
+  /** Promise-cached mutex; single Promise ensures no race on concurrent first calls. */
+  private _muPromise: Promise<import('async-mutex').Mutex> | null = null;
 
   constructor(handle: any) {
     if (!handle) throw new Error('Failed to open document');
@@ -519,6 +532,65 @@ class PdfDocumentImpl {
         native.freeRenderedImage(imgHandle);
       }
     }
+  }
+
+  /** Lazy-initialises the per-instance Mutex (avoids a hard dep at load time). */
+  private _getMutex(): Promise<import('async-mutex').Mutex> {
+    if (!this._muPromise) {
+      this._muPromise = import('async-mutex').then(({ Mutex }) => new Mutex());
+    }
+    return this._muPromise;
+  }
+
+  /**
+   * Async variant of {@link renderPageWithOptions} serialised through a
+   * per-instance mutex. Use when calling from `worker_threads` or `Promise.all`.
+   */
+  async renderPageWithOptionsAsync(
+    pageIndex: number,
+    options: RenderOptions = {}
+  ): Promise<Uint8Array> {
+    const mu = await this._getMutex();
+    return mu.runExclusive(() => this.renderPageWithOptions(pageIndex, options));
+  }
+
+  /**
+   * Async variant of {@link renderPageFit} serialised through a per-instance mutex.
+   */
+  async renderPageFitAsync(
+    pageIndex: number,
+    width: number,
+    height: number,
+    format: 'png' | 'jpeg' = 'png'
+  ): Promise<Uint8Array> {
+    const mu = await this._getMutex();
+    return mu.runExclusive(() => this.renderPageFit(pageIndex, width, height, format));
+  }
+
+  /**
+   * Renders a page as raw premultiplied RGBA8888 pixels. No PNG/JPEG encoding
+   * overhead — useful for direct handoff to image-processing libraries.
+   * @param pageIndex Zero-based page index.
+   * @param dpi Resolution in dots per inch (default 150).
+   */
+  renderToPixmap(pageIndex: number, dpi = 150): RgbaPixmap {
+    this.ensureOpen();
+    if (dpi <= 0) throw new RangeError(`dpi must be > 0, got ${dpi}`);
+    const { imgHandle, width, height } = native.renderPageRaw(this._handle, pageIndex, dpi);
+    try {
+      const buf = native.pdfGetRenderedImageData(imgHandle);
+      return { data: Buffer.from(buf), width, height };
+    } finally {
+      if (native.freeRenderedImage) native.freeRenderedImage(imgHandle);
+    }
+  }
+
+  /**
+   * Async variant of {@link renderToPixmap} serialised through a per-instance mutex.
+   */
+  async renderToPixmapAsync(pageIndex: number, dpi = 150): Promise<RgbaPixmap> {
+    const mu = await this._getMutex();
+    return mu.runExclusive(() => this.renderToPixmap(pageIndex, dpi));
   }
 
   page(index: number): Page {
@@ -807,6 +879,9 @@ function generateQrCodeSvg(
 // Export as ES module
 const getVersion = native.getVersion;
 const getPdfOxideVersion = native.getPdfOxideVersion;
+const getActiveCryptoProvider = native.getActiveCryptoProvider;
+const isFipsCryptoAvailable = native.isFipsCryptoAvailable;
+const useFipsCryptoProvider = native.useFipsCryptoProvider;
 const PdfDocument = PdfDocumentImpl as any;
 const Pdf = PdfImpl as any;
 const PdfError = PdfException;
@@ -883,6 +958,7 @@ export {
   FormFieldType,
   generateBarcodeSvg,
   generateQrCodeSvg,
+  getActiveCryptoProvider,
   getPdfOxideVersion,
   // Version info
   getVersion,
@@ -892,6 +968,7 @@ export {
   InvalidStateException,
   IoException,
   IssueSeverity,
+  isFipsCryptoAvailable,
   LayerManager,
   MetadataBuilder,
   MetadataManager,
@@ -951,6 +1028,7 @@ export {
   ThumbnailSize,
   UnknownError,
   UnsupportedFeatureException,
+  useFipsCryptoProvider,
   ValidationException,
   // Worker Threads API
   WorkerPool,
