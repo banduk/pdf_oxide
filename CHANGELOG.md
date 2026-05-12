@@ -2,6 +2,181 @@
 
 All notable changes to PDFOxide are documented here.
 
+## [0.3.47] - 2026-05-11
+
+This release closes the remaining bugs surfaced by the kreuzberg
+integration (issue [#484](https://github.com/yfedoseev/pdf_oxide/issues/484))
+and ships the related text-extraction quality fixes.  Word-F1 against the
+pdftotext-derived ground truth corpus now meets the kreuzberg quality
+floor for every PDF in the issue 484 set.
+
+### Fixed
+
+- **kreuzberg regression suite — all 24 PDFs now meet the F1 floor
+  ([#484](https://github.com/yfedoseev/pdf_oxide/issues/484))** —
+  `extract_text` previously failed three documents reported by
+  @Goldziher on the kreuzberg corpus: `pdfa_039.pdf` (swimming-results
+  table) returned F1 0.810, `pr-136-example.pdf` (CJK financial document)
+  returned F1 0.709, and `annotations.pdf` returned F1 0.545.  Three
+  separate root-cause fixes restore them to F1 ≥ 0.85:
+  - `eliminate duplicate emission of multi-row table labels` — the
+    text-only spatial fallback in `detect_tables_with_lines` now
+    requires `config.text_fallback=true` (which `extract_text` does
+    not pass) so report-style PDFs with decorative ruling lines no
+    longer get their cell content emitted twice; `span_in_table` adds
+    a text-match fallback to catch label spans whose font ascent
+    extends slightly above the cell's ink box (issue-53-example.pdf
+    F1 0.867 → 0.992).
+  - `tighten cross-font glue and decimal merge for CJK + Latin
+    layouts` — `cross_font_word_glue` no longer fires on a CJK ↔
+    non-CJK boundary (CJK ideographs satisfy `is_alphabetic()` per
+    Unicode and were being concatenated with adjacent Latin); the
+    `decimal_merge` heuristic requires a column-boundary-sized gap
+    (gap > 0.4 em) so per-glyph Tj operators in CJK documents stop
+    mangling "2013" into "201.3" (pr-136 F1 0.709 → 0.884).
+  - `narrow CJK boundary forced-space to script glyphs only` —
+    `should_insert_space` now actively inserts a space at the
+    CJK ↔ non-CJK boundary to match pdftotext tokenisation, but
+    restricted to actual script glyphs (ideographs, kana, hangul);
+    fullwidth ASCII operators like ＜ ＞ ＝ μ stay inline with
+    adjacent digits/Latin so compound tokens like "60000≤Q＜80000"
+    are preserved (issue-336 text quality gate stays at PASS).
+  Reported by @Goldziher.
+
+- **`extract_spans` now exposes a `merge_tm_tj_runs` opt-out
+  ([#488](https://github.com/yfedoseev/pdf_oxide/issues/488))** —
+  Same-line Tm+Tj runs were unconditionally batched into a single
+  `TextSpan`, throwing away the per-Tm positioning that downstream
+  layout-analysis code (e.g. column-aware table detection) needs.
+  `SpanMergingConfig::merge_tm_tj_runs` (default `true` for backward
+  compatibility) now flushes the span buffer at every Tm operator so
+  callers can opt in to one span per Tm+Tj group, matching the
+  granularity of `pdftotext -bbox-layout`.  Reported by @haberman.
+
+- **`saveEncryptedToBytes` no longer panics in browser WASM
+  ([#492](https://github.com/yfedoseev/pdf_oxide/issues/492))** —
+  `generate_file_id` (per ISO 32000-1 §14.4) called
+  `std::time::SystemTime::now()`, which is unimplemented on
+  `wasm32-unknown-unknown`.  Cfg-gated so the WASM build derives the
+  file identifier from `uuid::Uuid::new_v4()` only — still a unique
+  opaque 16-byte ID per the spec.  Reported by @eersis-byte.
+
+- **CJK fullwidth operator spacing in `to_markdown` / `to_html`
+  ([#485](https://github.com/yfedoseev/pdf_oxide/issues/485)) —
+  partial fix.** Two layers:
+  - `pipeline/converters/has_horizontal_gap` suppresses space
+    insertion when one side is CJK and the other is CJK or a
+    fullwidth/math operator (≤, ＜, ＞, ＝, μ, etc.), mirroring the
+    text-extraction CJK-pair suppression.
+  - `extract_cell_text` no longer inserts an unconditional space
+    between adjacent spans on the same row of a table cell — uses
+    the same gap-aware separator rules as the inline-flow path so
+    multi-span cells like `60000≤Q＜80000` (rendered as 5 separate
+    Tj operators) keep their compound tokens intact.
+  The fix lifts `extract_text` from F1 0.612 to 0.820 on
+  `issue-336-example.pdf`.  `to_markdown` / `to_html` still score
+  below threshold (0.577 / 0.632 vs 0.69 / 0.65) because the
+  underlying tables get fragmented into single-row tables that the
+  is_real_grid filter rejects, after which the column-based reading
+  order splits each row across multiple `<p>` paragraphs — that
+  reading-order layer is tracked separately for a follow-up.
+
+- **Text-only spatial table fallback for line-less tables in
+  `to_markdown`
+  ([#486](https://github.com/yfedoseev/pdf_oxide/issues/486)) —
+  partial fix.** `extract_page_tables` now opts in to a relaxed
+  text-only detection when the caller is a converter (text_fallback=
+  true), with the column ceiling raised from 15 to 25 so that
+  sailing-score grids with 16-18 score columns are no longer
+  rejected outright.  Markdown still drops the score data on the
+  larger nougat_018 table because the fragmentation produces
+  single-row sub-tables that fail `is_real_grid` — converging the
+  fragmented sub-tables into one logical table is the remaining
+  work.
+
+- **HTML table cell rendering aligned with markdown
+  ([#487](https://github.com/yfedoseev/pdf_oxide/issues/487)) —
+  partial fix.** `to_html` now uses the same span-walking and
+  bold/italic preservation as `to_markdown`'s
+  `render_table_markdown`.  Three of four affected docs improved
+  by 1-4 % Jaccard but two (nougat_018, nougat_026) still trail the
+  threshold pending the table-fragmentation work above.
+
+- **RTL inline emphasis stripping in markdown extraction
+  ([#459](https://github.com/yfedoseev/pdf_oxide/issues/459))** —
+  RTL detection now strips `<strong>` / `<em>` markers from
+  visually-reversed runs in `to_markdown` consistently with the
+  plain-text path; spec basis ISO 32000-1 §14.8.2.3.3 (Reverse-
+  Order Show Strings).  46 unit tests in
+  `tests/test_rtl_script_support.rs` cover the detector, BiDi
+  algorithm, and inline-flow integration.
+
+- **Multi-byte CMap parsing and array-form `beginbfrange`
+  (§9.7.5)** — `beginbfrange ... endbfrange` array notation
+  `<src> <src> [<dst1> <dst2> ...]` was not fully covered; the
+  CMap parser now matches the spec's allowed grammar so multi-byte
+  CIDs map correctly through ToUnicode CMaps.
+
+- **`/StructTreeRoot`-only tagged PDFs (§14.7.4)** — Documents
+  that declare `/StructTreeRoot` in the catalog without a
+  `/MarkInfo` dictionary (PDF 1.4 documents, valid per the spec)
+  now correctly use the structure tree for table-cell content
+  extraction.  Resolves `/OBJR` content-item references during
+  tree traversal so OBJR-referenced annotations and XObjects are
+  no longer lost.
+
+- **Indirect references in MediaBox/CropBox accessors (§7.7.3.4)**
+  — Page attribute accessors now resolve `/MediaBox` and `/CropBox`
+  through indirect references and the `/Pages` inheritance chain.
+  This is what made the Bucket A errors in the issue 484 retest
+  comment (`annotations*.pdf`, `pdfa_039.pdf`) parse successfully.
+
+- **CTM-aware cache key for Form XObject span extraction** — Form
+  XObject spans were cached by XObject reference alone, returning
+  stale coordinates for the same XObject reused on multiple pages
+  with different CTM transforms.  Cache key now includes the CTM
+  so repeated XObjects produce correctly-positioned spans on each
+  invocation.
+
+- **`notdefrange` U+FFFD no longer blocks the CID-as-Unicode
+  fallback (§9.10.2)** — Per the spec, U+FFFD (REPLACEMENT
+  CHARACTER) signals "no proper Unicode mapping", so a notdefrange
+  hit must not stop the priority list.  The Identity CID-as-Unicode
+  fallback (Priority 3) now fires correctly for composite fonts
+  whose ToUnicode CMap returns U+FFFD.
+
+- **ToUnicode Priority-3 fallback guarded for composite fonts
+  (§9.10.2)** — The CID-as-Unicode fallback is now only applied
+  to fonts whose CMap is one of the predefined composite-font
+  CMaps or whose CIDFont uses one of the Adobe character
+  collections, matching the spec's enumeration; misapplication on
+  other fonts could produce mojibake on previously-working files.
+
+### Notes
+
+- All 4 987 unit tests pass; one quality-gate test
+  (`test_text_fallback_detects_lineless_grid` in
+  `src/structure/spatial_table_detector.rs`) was updated to set
+  `text_fallback: true` explicitly since the default no longer
+  enables it.
+- Six quality-gate Jaccard tests in
+  `tests/test_corpus_extraction_quality.rs` remain failing
+  against their target thresholds (issue-336 md/html, nougat_018
+  md/html, nougat_026 html, pdfa_036 html); those are tracked
+  under #485, #486, #487 as the partial-fix work continues.
+
+### Thanks
+
+This release was driven entirely by community bug reports and the
+kreuzberg integration test feedback loop:
+
+- @Goldziher (kreuzberg-dev) — opened #484 with a calibrated 166-PDF
+  regression suite and follow-up retest comments that turned every
+  remaining gap into a focused root-cause fix
+- @haberman — opened #488 with a minimal Rust reproducer for the
+  Tm+Tj merging issue
+- @eersis-byte — opened #492 with the WASM `SystemTime` panic backtrace
+
 ## [0.3.46] - 2026-05-10
 
 ### Added
