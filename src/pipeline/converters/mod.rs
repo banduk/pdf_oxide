@@ -156,23 +156,64 @@ pub(crate) fn has_horizontal_gap(prev: &TextSpan, current: &TextSpan) -> bool {
     true
 }
 
-/// Return the index of the table whose bounding box contains the span's origin,
-/// or `None` if the span does not fall inside any table region.
+/// Return the index of the table whose bounding box contains the span's
+/// origin AND that has a cell whose bbox also contains the span — i.e.
+/// the table is actually going to render this span as part of a cell.
+///
+/// Returning `Some(idx)` causes `convert_semantic_mode` (md/html) to skip
+/// the span from paragraph flow on the assumption that the table render
+/// will emit it.  If the span sits inside the table's *outer* bbox but
+/// the spatial column-clustering missed the column it belongs to (a
+/// sparse / variable-width score column on wide sailing-results grids
+/// — issue 486 / 487), no cell will contain it and the table render
+/// drops the content.  Treating that span as "outside the table" lets
+/// the paragraph flow pick it up so the text is not lost.
 pub(crate) fn span_in_table(span: &OrderedTextSpan, tables: &[Table]) -> Option<usize> {
     let sx = span.span.bbox.x;
     let sy = span.span.bbox.y;
 
     for (i, table) in tables.iter().enumerate() {
-        if let Some(ref bbox) = table.bbox {
-            let tolerance = 2.0;
-            if sx >= bbox.x - tolerance
-                && sx <= bbox.x + bbox.width + tolerance
-                && sy >= bbox.y - tolerance
-                && sy <= bbox.y + bbox.height + tolerance
-            {
-                return Some(i);
-            }
+        let Some(ref bbox) = table.bbox else { continue };
+        let tolerance = 2.0;
+        let in_outer_bbox = sx >= bbox.x - tolerance
+            && sx <= bbox.x + bbox.width + tolerance
+            && sy >= bbox.y - tolerance
+            && sy <= bbox.y + bbox.height + tolerance;
+        if !in_outer_bbox {
+            continue;
         }
+        // Span is geometrically inside the table — verify a cell will
+        // own it.  Walks all rows / cells once; tables that get through
+        // is_real_grid are typically small enough (≤30 rows × ≤25 cols)
+        // that this is negligible vs. the cost of running the conversion.
+        //
+        // Special case: a Table with no cell bboxes at all (e.g. when
+        // built from MCID-based tagged-PDF extraction, or in unit-test
+        // fixtures) carries the rendering responsibility wholesale —
+        // there is no per-cell layout to consult.  Fall back to the
+        // outer-bbox containment for that case so we don't silently
+        // skip the table rendering.
+        let has_any_cell_bbox = table
+            .rows
+            .iter()
+            .any(|row| row.cells.iter().any(|c| c.bbox.is_some()));
+        if !has_any_cell_bbox {
+            return Some(i);
+        }
+        let span_owned = table.rows.iter().any(|row| {
+            row.cells.iter().any(|cell| {
+                let Some(cb) = cell.bbox else { return false };
+                sx >= cb.x - tolerance
+                    && sx <= cb.x + cb.width + tolerance
+                    && sy >= cb.y - tolerance
+                    && sy <= cb.y + cb.height + tolerance
+            })
+        });
+        if span_owned {
+            return Some(i);
+        }
+        // Span sits in the outer bbox but no cell claims it; fall through
+        // to paragraph flow so the content is not silently dropped.
     }
     None
 }
