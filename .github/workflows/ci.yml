@@ -432,7 +432,7 @@ jobs:
           after_kb=$(( $(stat -c%s "$out") / 1024 ))
           echo "Before wasm-opt: ${before_kb} KB"
           echo "After  wasm-opt: ${after_kb} KB"
-          # Size regression gate: v0.3.46 baseline after -Oz is ~11.25 MB
+          # Size regression gate: v0.3.47 baseline after -Oz is ~11.25 MB
           # (grew from 10.4 MB with fast_image_resize SIMD downscaling and
           # hayro-jbig2 JBIG2 decoder added to the rendering feature).
           # Ceiling leaves ~6% headroom above the 11520 KB measured baseline.
