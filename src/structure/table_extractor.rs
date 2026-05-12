@@ -469,6 +469,16 @@ pub(super) fn span_text_for_cell(span: &crate::layout::TextSpan) -> String {
         return text.clone();
     }
     let char_count = text.chars().count();
+    // Signal 1: sparse char_widths array (cw.len < char_count) means the
+    // span was assembled from two concatenated Tj runs — see the matching
+    // `is_column_spanning_decimal` rule in document.rs.  Catches sailing-
+    // score cells emitted as a single Tj like "1.10" (cw=[w]) where the
+    // PDF actually means "1" followed by "10" in adjacent score columns
+    // (issue 487 nougat_018).  bbox.width can still be tight here, so the
+    // bbox-inflation check below isn't sufficient.
+    if !span.char_widths.is_empty() && span.char_widths.len() < char_count {
+        return format!("{} {}", &text[..dot_pos], &text[dot_pos + 1..]);
+    }
     let expected_width = if !span.char_widths.is_empty() {
         let cw_sum: f32 = span.char_widths.iter().sum();
         cw_sum * (char_count as f32 / span.char_widths.len() as f32)

@@ -5735,7 +5735,7 @@ impl PdfDocument {
     /// sailing-score / competition-table PDFs where two adjacent columns (e.g. Q8=1,
     /// F9=10) are stored as a single Tj text run "1.10" spanning both column cells.
     /// kreuzberg's GT tokenises them as separate words; we must split at the dot.
-    fn is_column_spanning_decimal(span: &TextSpan) -> bool {
+    pub(crate) fn is_column_spanning_decimal(span: &TextSpan) -> bool {
         let text = &span.text;
         let dot_pos = match text.find('.') {
             Some(p) if p > 0 && p < text.len() - 1 => p,
@@ -5751,6 +5751,21 @@ impl PdfDocument {
             return false;
         }
         let char_count = text.chars().count();
+        // Signal 1: sparse char_widths array.  When the font's glyph
+        // iteration produces fewer advance-width entries than there are
+        // characters in the decoded string, the span was assembled from two
+        // (or more) concatenated Tj runs whose widths come from different
+        // points in the glyph table.  This is the exact pattern issue 487
+        // nougat_018 sailing-score grids hit: each score cell is emitted as
+        // a single Tj like `1.10` with `char_widths=[w]` while the PDF
+        // semantically means "1" followed by "10" in adjacent score
+        // columns.  bbox.width can still be tight here (the producer set
+        // it to cover just the rendered glyph run), so the existing
+        // bbox-inflation check below misses these.  Catch them via the
+        // sparse-cw signal directly.
+        if !span.char_widths.is_empty() && span.char_widths.len() < char_count {
+            return true;
+        }
         let expected_width = if !span.char_widths.is_empty() {
             let cw_sum: f32 = span.char_widths.iter().sum();
             cw_sum * (char_count as f32 / span.char_widths.len() as f32)
@@ -5777,7 +5792,7 @@ impl PdfDocument {
     /// where "Theorem" widths come from the font's glyph table and "1.7" doesn't have
     /// matching glyph entries).  Return the byte offset at which to insert a space,
     /// or None if no split is appropriate.
-    fn char_widths_boundary_split(span: &TextSpan) -> Option<usize> {
+    pub(crate) fn char_widths_boundary_split(span: &TextSpan) -> Option<usize> {
         let cw_len = span.char_widths.len();
         if cw_len == 0 {
             return None;
@@ -5987,7 +6002,7 @@ impl PdfDocument {
     /// Priority 1: column-spanning decimal (nougat_018 sailing tables).
     /// Priority 2: char_widths boundary split (pdfa_004 CID-font merge artifacts).
     #[inline]
-    fn push_span_text(out: &mut String, span: &TextSpan) {
+    pub(crate) fn push_span_text(out: &mut String, span: &TextSpan) {
         // A span whose entire text is one or more newline/CR characters is a
         // ToUnicode line-break signal.  Treat it as a logical newline separator rather
         // than emitting the raw control characters verbatim as visible content.

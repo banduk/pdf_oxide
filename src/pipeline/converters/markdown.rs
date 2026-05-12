@@ -463,7 +463,13 @@ impl MarkdownOutputConverter {
                             active_italic = is_italic;
                         }
 
-                        let mut text = span.text.replace('|', "\\|").replace('\n', " ");
+                        // Apply column-spanning-decimal split (issue 487
+                        // nougat_018): sailing-score cells emitted as a
+                        // single Tj "1.10" with sparse char_widths split
+                        // into two tokens "1 10".
+                        let mut processed_text = String::new();
+                        crate::document::PdfDocument::push_span_text(&mut processed_text, span);
+                        let mut text = processed_text.replace('|', "\\|").replace('\n', " ");
                         let just_opened = is_bold || is_italic;
                         if just_opened && (cell_md.ends_with("**") || cell_md.ends_with('*')) {
                             while text.starts_with(' ') {
@@ -900,7 +906,13 @@ impl MarkdownOutputConverter {
                 continue;
             }
 
-            let mut text_str = span.span.text.clone();
+            // Apply column-spanning-decimal / char_widths-boundary split
+            // (issue 487 nougat_018).  Mirrors `push_span_text` in the text
+            // extractor so sailing-score cells like "1.10" (sparse cw,
+            // really `1` + `10` in adjacent columns) split into two tokens
+            // for markdown output too.
+            let mut text_str = String::new();
+            crate::document::PdfDocument::push_span_text(&mut text_str, &span.span);
 
             // Normalize known mis-extracted bullet glyphs (DEL from Zapf
             // Dingbats mappings, ❍ from ligature remaps) to U+2022 so the
@@ -1027,7 +1039,15 @@ impl MarkdownOutputConverter {
                     if !result.ends_with(' ') && !result.ends_with('\n') {
                         result.push(' ');
                     }
-                    result.push_str(&orphan.span.text);
+                    // Apply column-spanning-decimal / char_widths-boundary
+                    // split (issue 487 nougat_018): orphan score spans
+                    // emitted as "25.10" with sparse cw split into "25 10".
+                    let mut processed = String::new();
+                    crate::document::PdfDocument::push_span_text(
+                        &mut processed,
+                        &orphan.span,
+                    );
+                    result.push_str(&processed);
                 }
             }
         }

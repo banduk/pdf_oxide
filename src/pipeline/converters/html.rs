@@ -184,7 +184,19 @@ impl HtmlOutputConverter {
     ///
     /// Applies bold (<strong>) and italic (<em>) tags as needed.
     fn format_span_with_styles(&self, span: &OrderedTextSpan, text: &str) -> String {
-        let escaped = Self::escape_html(text);
+        // Apply the same column-spanning-decimal / char_widths-boundary
+        // split that the text extractor's `push_span_text` uses.  For
+        // sailing-score PDFs (issue 487 nougat_018) the producer emits two
+        // adjacent score cells as a single Tj like "1.10" with cw=[w].
+        // Without this step, markdown / HTML keep them glued as `1.10`
+        // instead of splitting into the two GT tokens `1` and `10`.
+        let mut processed = String::new();
+        let synthetic = crate::layout::TextSpan {
+            text: text.to_string(),
+            ..span.span.clone()
+        };
+        crate::document::PdfDocument::push_span_text(&mut processed, &synthetic);
+        let escaped = Self::escape_html(&processed);
 
         let mut result = escaped;
 
@@ -493,7 +505,12 @@ impl HtmlOutputConverter {
                 }
             }
 
-            let escaped = Self::escape_html(&span.text);
+            // Apply column-spanning-decimal split (issue 487 nougat_018):
+            // sailing-score cells emitted as "1.10" with sparse char_widths
+            // split into two tokens "1 10".
+            let mut processed = String::new();
+            crate::document::PdfDocument::push_span_text(&mut processed, span);
+            let escaped = Self::escape_html(&processed);
 
             let styled = match (is_bold, is_italic) {
                 (true, true) => format!("<strong><em>{}</em></strong>", escaped),
