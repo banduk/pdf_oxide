@@ -101,6 +101,13 @@ pub struct SeparationPlate {
 ///
 /// Each plate is a grayscale image where pixel intensity equals the
 /// tint percentage of that ink (255 = full tint, 0 = no ink).
+///
+/// # Performance
+///
+/// The content stream is parsed **once** and the operator walk dispatches
+/// paint operations to all referenced plates in parallel. Form XObjects
+/// are also recursed into once per page. Unreferenced inks short-circuit
+/// to an all-zero plate before any pixmap is allocated.
 pub fn render_separations(
     doc: &PdfDocument,
     page_num: usize,
@@ -116,16 +123,7 @@ pub fn render_separations(
     // pixmap and skip the per-plate operator walk entirely (O6).
     let referenced = collect_referenced_inks(doc, page_num)?;
 
-    let mut plates = Vec::with_capacity(inks.len());
-    for ink in &inks {
-        let plate = if referenced.contains(ink) {
-            render_single_separation(doc, page_num, ink, dpi)?
-        } else {
-            empty_plate_for(doc, page_num, ink, dpi)?
-        };
-        plates.push(plate);
-    }
-    Ok(plates)
+    render_plates_for_inks(doc, page_num, dpi, &inks, &referenced)
 }
 
 /// Render a single ink separation plate for a page.
@@ -133,13 +131,122 @@ pub fn render_separations(
 /// Returns a grayscale image where pixel intensity = tint percentage
 /// of the named ink. If the ink is not present on the page, the plate
 /// is all zeros.
+///
+/// This is a thin wrapper over the multi-ink path; if you need every
+/// plate on a page, call [`render_separations`] instead — it walks the
+/// content stream once for all inks together.
 pub fn render_separation(
     doc: &PdfDocument,
     page_num: usize,
     ink_name: &str,
     dpi: u32,
 ) -> Result<SeparationPlate> {
-    render_single_separation(doc, page_num, ink_name, dpi)
+    // Always walk operators for the requested ink — the per-page short-circuit
+    // in [`render_separations`] is an optimisation that scans the resource
+    // declarations to skip inks that are *definitely* unused. For the single-ink
+    // entry point the caller has already named the ink they want, and the
+    // scanner can miss inks reached via DefaultRGB/DefaultGray remapping
+    // through colour operators like `rg`/`g`. Treat the named ink as referenced
+    // and let the operator walk produce an honest plate.
+    let inks = vec![ink_name.to_string()];
+    let referenced = inks.clone();
+    let mut plates = render_plates_for_inks(doc, page_num, dpi, &inks, &referenced)?;
+    plates
+        .pop()
+        .ok_or_else(|| Error::InvalidPdf("render_separation: no plate produced".to_string()))
+}
+
+/// Core multi-ink rendering: allocate one pixmap per referenced ink,
+/// walk the content stream once, and extract grayscale data from each.
+fn render_plates_for_inks(
+    doc: &PdfDocument,
+    page_num: usize,
+    dpi: u32,
+    inks: &[String],
+    referenced: &[String],
+) -> Result<Vec<SeparationPlate>> {
+    let (width, height, base_transform) = compute_page_extent(doc, page_num, dpi)?;
+
+    // Partition inks into "needs rendering" vs "short-circuit to empty plate".
+    // We track the original index so the output order matches `inks`.
+    let mut render_indices: Vec<usize> = Vec::new();
+    let mut empty_indices: Vec<usize> = Vec::new();
+    for (i, ink) in inks.iter().enumerate() {
+        if referenced.iter().any(|r| r == ink) {
+            render_indices.push(i);
+        } else {
+            empty_indices.push(i);
+        }
+    }
+
+    // Build pixmaps and a parallel `target_inks` slice for the inks we
+    // actually need to walk operators for.
+    let mut pixmaps: Vec<Pixmap> = Vec::with_capacity(render_indices.len());
+    for _ in &render_indices {
+        let pixmap = Pixmap::new(width, height)
+            .ok_or_else(|| Error::InvalidPdf("Failed to create separation pixmap".to_string()))?;
+        pixmaps.push(pixmap);
+    }
+    let target_inks: Vec<&str> = render_indices.iter().map(|&i| inks[i].as_str()).collect();
+
+    if !pixmaps.is_empty() {
+        let resources = doc.get_page_resources(page_num)?;
+        let color_spaces = load_color_spaces(doc, &resources)?;
+        let fonts = load_fonts(doc, &resources);
+        let text_rasterizer = TextRasterizer::new();
+
+        let content_data = doc.get_page_content_data(page_num)?;
+        let operators = parse_content_stream(&content_data)?;
+
+        let mut ctx = SeparationContext {
+            doc,
+            text_rasterizer: &text_rasterizer,
+            fonts: &fonts,
+        };
+
+        execute_separation_operators(
+            &mut pixmaps,
+            base_transform,
+            &operators,
+            &mut ctx,
+            &resources,
+            &color_spaces,
+            None,
+            &target_inks,
+        )?;
+    }
+
+    // Re-assemble in original ink order: empty plates for unreferenced
+    // inks, extracted R channel for rendered ones.
+    let pixel_count = (width as usize) * (height as usize);
+    let mut result: Vec<Option<SeparationPlate>> = (0..inks.len()).map(|_| None).collect();
+
+    for (k, &i) in render_indices.iter().enumerate() {
+        let mut data = vec![0u8; pixel_count];
+        let rgba = pixmaps[k].data();
+        for j in 0..pixel_count {
+            data[j] = rgba[j * 4];
+        }
+        result[i] = Some(SeparationPlate {
+            ink_name: inks[i].clone(),
+            data,
+            width,
+            height,
+        });
+    }
+    for &i in &empty_indices {
+        result[i] = Some(SeparationPlate {
+            ink_name: inks[i].clone(),
+            data: vec![0u8; pixel_count],
+            width,
+            height,
+        });
+    }
+
+    Ok(result
+        .into_iter()
+        .map(|o| o.expect("plate filled"))
+        .collect())
 }
 
 /// Collect all ink names present on a page.
@@ -166,25 +273,6 @@ fn collect_page_inks(doc: &PdfDocument, page_num: usize) -> Result<Vec<String>> 
     }
 
     Ok(inks)
-}
-
-/// Build a (width × height) all-zero plate without walking the operator
-/// stream. Used when [`collect_referenced_inks`] proves the ink is not
-/// touched anywhere on the page.
-fn empty_plate_for(
-    doc: &PdfDocument,
-    page_num: usize,
-    ink_name: &str,
-    dpi: u32,
-) -> Result<SeparationPlate> {
-    let (width, height, _) = compute_page_extent(doc, page_num, dpi)?;
-    let pixel_count = (width as usize) * (height as usize);
-    Ok(SeparationPlate {
-        ink_name: ink_name.to_string(),
-        data: vec![0u8; pixel_count],
-        width,
-        height,
-    })
 }
 
 /// Walk the content stream (and any Form XObjects it references) and
@@ -370,59 +458,6 @@ fn compute_page_extent(
     };
 
     Ok((width, height, base_transform))
-}
-
-/// Core rendering logic for a single separation plate.
-fn render_single_separation(
-    doc: &PdfDocument,
-    page_num: usize,
-    ink_name: &str,
-    dpi: u32,
-) -> Result<SeparationPlate> {
-    let (width, height, base_transform) = compute_page_extent(doc, page_num, dpi)?;
-
-    let mut pixmap = Pixmap::new(width, height)
-        .ok_or_else(|| Error::InvalidPdf("Failed to create separation pixmap".to_string()))?;
-
-    let resources = doc.get_page_resources(page_num)?;
-    let color_spaces = load_color_spaces(doc, &resources)?;
-    let fonts = load_fonts(doc, &resources);
-    let text_rasterizer = TextRasterizer::new();
-
-    let content_data = doc.get_page_content_data(page_num)?;
-    let operators = parse_content_stream(&content_data)?;
-
-    let _ = page_num; // kept in the public API surface; not needed past extent computation
-    let mut ctx = SeparationContext {
-        doc,
-        target_ink: ink_name,
-        text_rasterizer: &text_rasterizer,
-        fonts: &fonts,
-    };
-
-    execute_separation_operators(
-        &mut pixmap,
-        base_transform,
-        &operators,
-        &mut ctx,
-        &resources,
-        &color_spaces,
-        None,
-    )?;
-
-    let pixel_count = (width * height) as usize;
-    let mut data = vec![0u8; pixel_count];
-    let rgba = pixmap.data();
-    for i in 0..pixel_count {
-        data[i] = rgba[i * 4];
-    }
-
-    Ok(SeparationPlate {
-        ink_name: ink_name.to_string(),
-        data,
-        width,
-        height,
-    })
 }
 
 /// Resolved colour-space classification used by the separation pipeline.
@@ -694,9 +729,14 @@ fn tint_for_ink(
 
 /// Per-render shared context (read-only) passed through the operator
 /// walk and into recursive Form XObject invocations.
+///
+/// The set of target inks is **not** stored here; instead it is passed
+/// as a separate `target_inks: &[&str]` slice alongside the `&mut [Pixmap]`
+/// to [`execute_separation_operators`]. This keeps the borrow checker
+/// happy: the pixmaps slice is the only `&mut` in play, while everything
+/// in `SeparationContext` is `&`.
 struct SeparationContext<'a> {
     doc: &'a PdfDocument,
-    target_ink: &'a str,
     text_rasterizer: &'a TextRasterizer,
     fonts: &'a HashMap<String, Arc<FontInfo>>,
 }
@@ -754,16 +794,26 @@ struct InheritedState {
     stroke_components: Vec<f32>,
 }
 
-/// Execute operators for separation plate rendering.
+/// Execute operators for separation plate rendering, dispatching paint
+/// operations to **all** target inks in parallel.
+///
+/// `pixmaps` and `target_inks` are parallel slices: `pixmaps[i]` receives
+/// paint for ink `target_inks[i]`. The operator stream is walked exactly
+/// once; every paint site (fill, stroke, text, Form XObject) iterates the
+/// pair list and contributes to each plate whose ink the current colour
+/// touches.
+#[allow(clippy::too_many_arguments)]
 fn execute_separation_operators(
-    pixmap: &mut Pixmap,
+    pixmaps: &mut [Pixmap],
     base_transform: Transform,
     operators: &[Operator],
     ctx: &mut SeparationContext<'_>,
     resources: &Object,
     color_spaces: &HashMap<String, Object>,
     inherited: Option<&InheritedState>,
+    target_inks: &[&str],
 ) -> Result<()> {
+    debug_assert_eq!(pixmaps.len(), target_inks.len());
     let mut gs_stack = GraphicsStateStack::new();
     {
         let gs = gs_stack.current_mut();
@@ -811,6 +861,14 @@ fn execute_separation_operators(
             .and_then(|o| ctx.doc.resolve_object(o).ok()),
         _ => None,
     };
+
+    // Pixmap extent — every plate shares the same dimensions because they
+    // all originate from a single allocation in `render_plates_for_inks`.
+    // If `pixmaps` is empty (no inks to render), use a zero extent; the
+    // operator walk still progresses for graphics-state tracking but
+    // paint loops are no-ops because there are no targets.
+    let pixmap_width = pixmaps.first().map(|p| p.width()).unwrap_or(0);
+    let pixmap_height = pixmaps.first().map(|p| p.height()).unwrap_or(0);
 
     for op in operators {
         match op {
@@ -1018,7 +1076,8 @@ fn execute_separation_operators(
                 apply_separation_clip(
                     &mut pending_clip,
                     &mut clip_stack,
-                    pixmap,
+                    pixmap_width,
+                    pixmap_height,
                     base_transform,
                     &gs_stack,
                 );
@@ -1026,19 +1085,21 @@ fn execute_separation_operators(
                     let gs = gs_stack.current();
                     let empty = SeparationColorState::new();
                     let cs = color_state_stack.last().unwrap_or(&empty);
-                    if let Some(tint) = tint_for_ink(
-                        false,
-                        gs,
-                        color_spaces,
-                        resources,
-                        ctx.doc,
-                        ctx.target_ink,
-                        &cs.fill_components,
-                        &cs.stroke_components,
-                    ) {
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
-                        stroke_separation(pixmap, &path, transform, gs, tint, clip);
+                    let transform = combine_transforms(base_transform, &gs.ctm);
+                    let clip = clip_stack.last().and_then(|c| c.as_ref());
+                    for (i, &ink) in target_inks.iter().enumerate() {
+                        if let Some(tint) = tint_for_ink(
+                            false,
+                            gs,
+                            color_spaces,
+                            resources,
+                            ctx.doc,
+                            ink,
+                            &cs.fill_components,
+                            &cs.stroke_components,
+                        ) {
+                            stroke_separation(&mut pixmaps[i], &path, transform, gs, tint, clip);
+                        }
                     }
                 }
                 current_path = PathBuilder::new();
@@ -1047,7 +1108,8 @@ fn execute_separation_operators(
                 apply_separation_clip(
                     &mut pending_clip,
                     &mut clip_stack,
-                    pixmap,
+                    pixmap_width,
+                    pixmap_height,
                     base_transform,
                     &gs_stack,
                 );
@@ -1055,19 +1117,28 @@ fn execute_separation_operators(
                     let gs = gs_stack.current();
                     let empty = SeparationColorState::new();
                     let cs = color_state_stack.last().unwrap_or(&empty);
-                    if let Some(tint) = tint_for_ink(
-                        true,
-                        gs,
-                        color_spaces,
-                        resources,
-                        ctx.doc,
-                        ctx.target_ink,
-                        &cs.fill_components,
-                        &cs.stroke_components,
-                    ) {
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
-                        fill_separation(pixmap, &path, transform, tint, FillRule::Winding, clip);
+                    let transform = combine_transforms(base_transform, &gs.ctm);
+                    let clip = clip_stack.last().and_then(|c| c.as_ref());
+                    for (i, &ink) in target_inks.iter().enumerate() {
+                        if let Some(tint) = tint_for_ink(
+                            true,
+                            gs,
+                            color_spaces,
+                            resources,
+                            ctx.doc,
+                            ink,
+                            &cs.fill_components,
+                            &cs.stroke_components,
+                        ) {
+                            fill_separation(
+                                &mut pixmaps[i],
+                                &path,
+                                transform,
+                                tint,
+                                FillRule::Winding,
+                                clip,
+                            );
+                        }
                     }
                 }
                 current_path = PathBuilder::new();
@@ -1076,7 +1147,8 @@ fn execute_separation_operators(
                 apply_separation_clip(
                     &mut pending_clip,
                     &mut clip_stack,
-                    pixmap,
+                    pixmap_width,
+                    pixmap_height,
                     base_transform,
                     &gs_stack,
                 );
@@ -1084,19 +1156,28 @@ fn execute_separation_operators(
                     let gs = gs_stack.current();
                     let empty = SeparationColorState::new();
                     let cs = color_state_stack.last().unwrap_or(&empty);
-                    if let Some(tint) = tint_for_ink(
-                        true,
-                        gs,
-                        color_spaces,
-                        resources,
-                        ctx.doc,
-                        ctx.target_ink,
-                        &cs.fill_components,
-                        &cs.stroke_components,
-                    ) {
-                        let transform = combine_transforms(base_transform, &gs.ctm);
-                        let clip = clip_stack.last().and_then(|c| c.as_ref());
-                        fill_separation(pixmap, &path, transform, tint, FillRule::EvenOdd, clip);
+                    let transform = combine_transforms(base_transform, &gs.ctm);
+                    let clip = clip_stack.last().and_then(|c| c.as_ref());
+                    for (i, &ink) in target_inks.iter().enumerate() {
+                        if let Some(tint) = tint_for_ink(
+                            true,
+                            gs,
+                            color_spaces,
+                            resources,
+                            ctx.doc,
+                            ink,
+                            &cs.fill_components,
+                            &cs.stroke_components,
+                        ) {
+                            fill_separation(
+                                &mut pixmaps[i],
+                                &path,
+                                transform,
+                                tint,
+                                FillRule::EvenOdd,
+                                clip,
+                            );
+                        }
                     }
                 }
                 current_path = PathBuilder::new();
@@ -1105,7 +1186,8 @@ fn execute_separation_operators(
                 apply_separation_clip(
                     &mut pending_clip,
                     &mut clip_stack,
-                    pixmap,
+                    pixmap_width,
+                    pixmap_height,
                     base_transform,
                     &gs_stack,
                 );
@@ -1115,29 +1197,38 @@ fn execute_separation_operators(
                     let cs = color_state_stack.last().unwrap_or(&empty);
                     let transform = combine_transforms(base_transform, &gs.ctm);
                     let clip = clip_stack.last().and_then(|c| c.as_ref());
-                    if let Some(tint) = tint_for_ink(
-                        true,
-                        gs,
-                        color_spaces,
-                        resources,
-                        ctx.doc,
-                        ctx.target_ink,
-                        &cs.fill_components,
-                        &cs.stroke_components,
-                    ) {
-                        fill_separation(pixmap, &path, transform, tint, FillRule::Winding, clip);
-                    }
-                    if let Some(tint) = tint_for_ink(
-                        false,
-                        gs,
-                        color_spaces,
-                        resources,
-                        ctx.doc,
-                        ctx.target_ink,
-                        &cs.fill_components,
-                        &cs.stroke_components,
-                    ) {
-                        stroke_separation(pixmap, &path, transform, gs, tint, clip);
+                    for (i, &ink) in target_inks.iter().enumerate() {
+                        if let Some(tint) = tint_for_ink(
+                            true,
+                            gs,
+                            color_spaces,
+                            resources,
+                            ctx.doc,
+                            ink,
+                            &cs.fill_components,
+                            &cs.stroke_components,
+                        ) {
+                            fill_separation(
+                                &mut pixmaps[i],
+                                &path,
+                                transform,
+                                tint,
+                                FillRule::Winding,
+                                clip,
+                            );
+                        }
+                        if let Some(tint) = tint_for_ink(
+                            false,
+                            gs,
+                            color_spaces,
+                            resources,
+                            ctx.doc,
+                            ink,
+                            &cs.fill_components,
+                            &cs.stroke_components,
+                        ) {
+                            stroke_separation(&mut pixmaps[i], &path, transform, gs, tint, clip);
+                        }
                     }
                 }
                 current_path = PathBuilder::new();
@@ -1146,7 +1237,8 @@ fn execute_separation_operators(
                 apply_separation_clip(
                     &mut pending_clip,
                     &mut clip_stack,
-                    pixmap,
+                    pixmap_width,
+                    pixmap_height,
                     base_transform,
                     &gs_stack,
                 );
@@ -1156,29 +1248,38 @@ fn execute_separation_operators(
                     let cs = color_state_stack.last().unwrap_or(&empty);
                     let transform = combine_transforms(base_transform, &gs.ctm);
                     let clip = clip_stack.last().and_then(|c| c.as_ref());
-                    if let Some(tint) = tint_for_ink(
-                        true,
-                        gs,
-                        color_spaces,
-                        resources,
-                        ctx.doc,
-                        ctx.target_ink,
-                        &cs.fill_components,
-                        &cs.stroke_components,
-                    ) {
-                        fill_separation(pixmap, &path, transform, tint, FillRule::EvenOdd, clip);
-                    }
-                    if let Some(tint) = tint_for_ink(
-                        false,
-                        gs,
-                        color_spaces,
-                        resources,
-                        ctx.doc,
-                        ctx.target_ink,
-                        &cs.fill_components,
-                        &cs.stroke_components,
-                    ) {
-                        stroke_separation(pixmap, &path, transform, gs, tint, clip);
+                    for (i, &ink) in target_inks.iter().enumerate() {
+                        if let Some(tint) = tint_for_ink(
+                            true,
+                            gs,
+                            color_spaces,
+                            resources,
+                            ctx.doc,
+                            ink,
+                            &cs.fill_components,
+                            &cs.stroke_components,
+                        ) {
+                            fill_separation(
+                                &mut pixmaps[i],
+                                &path,
+                                transform,
+                                tint,
+                                FillRule::EvenOdd,
+                                clip,
+                            );
+                        }
+                        if let Some(tint) = tint_for_ink(
+                            false,
+                            gs,
+                            color_spaces,
+                            resources,
+                            ctx.doc,
+                            ink,
+                            &cs.fill_components,
+                            &cs.stroke_components,
+                        ) {
+                            stroke_separation(&mut pixmaps[i], &path, transform, gs, tint, clip);
+                        }
                     }
                 }
                 current_path = PathBuilder::new();
@@ -1187,7 +1288,8 @@ fn execute_separation_operators(
                 apply_separation_clip(
                     &mut pending_clip,
                     &mut clip_stack,
-                    pixmap,
+                    pixmap_width,
+                    pixmap_height,
                     base_transform,
                     &gs_stack,
                 );
@@ -1287,7 +1389,7 @@ fn execute_separation_operators(
             Operator::Tj { text } => {
                 if in_text_object {
                     let advance = render_text_to_plate(
-                        pixmap,
+                        pixmaps,
                         text,
                         base_transform,
                         &mut gs_stack,
@@ -1296,6 +1398,7 @@ fn execute_separation_operators(
                         resources,
                         ctx,
                         clip_stack.last().and_then(|c| c.as_ref()),
+                        target_inks,
                     )?;
                     let gs_mut = gs_stack.current_mut();
                     let advance_matrix = Matrix::translation(advance, 0.0);
@@ -1305,7 +1408,7 @@ fn execute_separation_operators(
             Operator::TJ { array } => {
                 if in_text_object {
                     let advance = render_tj_to_plate(
-                        pixmap,
+                        pixmaps,
                         array,
                         base_transform,
                         &mut gs_stack,
@@ -1314,6 +1417,7 @@ fn execute_separation_operators(
                         resources,
                         ctx,
                         clip_stack.last().and_then(|c| c.as_ref()),
+                        target_inks,
                     )?;
                     let gs_mut = gs_stack.current_mut();
                     let advance_matrix = Matrix::translation(advance, 0.0);
@@ -1329,7 +1433,7 @@ fn execute_separation_operators(
                     gs_mut.text_matrix = gs_mut.text_line_matrix;
 
                     let advance = render_text_to_plate(
-                        pixmap,
+                        pixmaps,
                         text,
                         base_transform,
                         &mut gs_stack,
@@ -1338,6 +1442,7 @@ fn execute_separation_operators(
                         resources,
                         ctx,
                         clip_stack.last().and_then(|c| c.as_ref()),
+                        target_inks,
                     )?;
                     let gs_mut = gs_stack.current_mut();
                     let advance_matrix = Matrix::translation(advance, 0.0);
@@ -1359,7 +1464,7 @@ fn execute_separation_operators(
                     gs_mut.text_matrix = gs_mut.text_line_matrix;
 
                     let advance = render_text_to_plate(
-                        pixmap,
+                        pixmaps,
                         text,
                         base_transform,
                         &mut gs_stack,
@@ -1368,6 +1473,7 @@ fn execute_separation_operators(
                         resources,
                         ctx,
                         clip_stack.last().and_then(|c| c.as_ref()),
+                        target_inks,
                     )?;
                     let gs_mut = gs_stack.current_mut();
                     let advance_matrix = Matrix::translation(advance, 0.0);
@@ -1439,13 +1545,14 @@ fn execute_separation_operators(
 
                                         let form_ops = parse_content_stream(&stream_data)?;
                                         execute_separation_operators(
-                                            pixmap,
+                                            pixmaps,
                                             combined,
                                             &form_ops,
                                             ctx,
                                             &form_resources,
                                             &merged_cs,
                                             Some(&inherited),
+                                            target_inks,
                                         )?;
                                     }
                                 }
@@ -1461,14 +1568,21 @@ fn execute_separation_operators(
     Ok(())
 }
 
-/// Render text into the separation pixmap, routing each glyph through the
-/// current ink's tint. The strategy is to clone the GraphicsState, replace
-/// its fill colour with a grayscale paint equal to the tint, and reuse
-/// the standard [`TextRasterizer`]. This preserves glyph shape, kerning,
-/// and anti-aliasing — the same fidelity as the page renderer.
+/// Render text into every target separation pixmap, routing each glyph
+/// through the per-ink tint. The strategy is to clone the GraphicsState,
+/// replace its fill colour with a grayscale paint equal to the tint, and
+/// reuse the standard [`TextRasterizer`]. This preserves glyph shape,
+/// kerning, and anti-aliasing — the same fidelity as the page renderer.
+///
+/// The returned advance is shared across all plates (the rasteriser is
+/// deterministic for a given font/text/state, so each plate's advance
+/// agrees) — we use the last computed value, matching the single-plate
+/// behaviour. If no plate is touched (all tints are `None` or render
+/// mode 3) the advance is computed from the font metrics so the text
+/// matrix still progresses correctly.
 #[allow(clippy::too_many_arguments)]
 fn render_text_to_plate(
-    pixmap: &mut Pixmap,
+    pixmaps: &mut [Pixmap],
     text: &[u8],
     base_transform: Transform,
     gs_stack: &mut GraphicsStateStack,
@@ -1477,6 +1591,7 @@ fn render_text_to_plate(
     resources: &Object,
     ctx: &mut SeparationContext<'_>,
     clip: Option<&Mask>,
+    target_inks: &[&str],
 ) -> Result<f32> {
     let gs = gs_stack.current();
     let empty = SeparationColorState::new();
@@ -1487,40 +1602,58 @@ fn render_text_to_plate(
         return measure_text_advance(text, gs, ctx.fonts);
     }
 
-    let tint = tint_for_ink(
-        true,
-        gs,
-        color_spaces,
-        resources,
-        ctx.doc,
-        ctx.target_ink,
-        &cs.fill_components,
-        &cs.stroke_components,
-    );
-    if tint.is_none() {
-        // Colour doesn't touch this plate — advance but don't paint.
-        return measure_text_advance(text, gs, ctx.fonts);
-    }
-    let tint = tint.unwrap();
-
-    // Build a faked-grayscale GraphicsState so the rasteriser paints in
-    // (tint, tint, tint) which becomes the plate value in the R channel.
-    let mut faux = gs.clone();
-    faux.fill_color_rgb = (tint, tint, tint);
-    faux.fill_alpha = 1.0;
-    faux.blend_mode = "Normal".to_string();
-
     let transform = combine_transforms(base_transform, &gs.ctm);
-    ctx.text_rasterizer
-        .render_text(pixmap, text, transform, &faux, resources, ctx.doc, clip, ctx.fonts)
+    let mut painted_advance: Option<f32> = None;
+
+    for (i, &ink) in target_inks.iter().enumerate() {
+        let tint = match tint_for_ink(
+            true,
+            gs,
+            color_spaces,
+            resources,
+            ctx.doc,
+            ink,
+            &cs.fill_components,
+            &cs.stroke_components,
+        ) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        // Build a faked-grayscale GraphicsState so the rasteriser paints in
+        // (tint, tint, tint) which becomes the plate value in the R channel.
+        let mut faux = gs.clone();
+        faux.fill_color_rgb = (tint, tint, tint);
+        faux.fill_alpha = 1.0;
+        faux.blend_mode = "Normal".to_string();
+
+        let advance = ctx.text_rasterizer.render_text(
+            &mut pixmaps[i],
+            text,
+            transform,
+            &faux,
+            resources,
+            ctx.doc,
+            clip,
+            ctx.fonts,
+        )?;
+        painted_advance = Some(advance);
+    }
+
+    match painted_advance {
+        Some(a) => Ok(a),
+        // No plate was touched by this text — still advance the matrix so
+        // subsequent glyphs land at the correct position.
+        None => measure_text_advance(text, gs, ctx.fonts),
+    }
 }
 
-/// Render a TJ array (sequence of strings + offsets) into the plate.
-/// Walks the array applying offsets between strings, painting each
-/// string component via [`render_text_to_plate`].
+/// Render a TJ array (sequence of strings + offsets) into all target
+/// plates. Walks the array applying offsets between strings, painting
+/// each string component via [`render_text_to_plate`].
 #[allow(clippy::too_many_arguments)]
 fn render_tj_to_plate(
-    pixmap: &mut Pixmap,
+    pixmaps: &mut [Pixmap],
     array: &[TextElement],
     base_transform: Transform,
     gs_stack: &mut GraphicsStateStack,
@@ -1529,13 +1662,14 @@ fn render_tj_to_plate(
     resources: &Object,
     ctx: &mut SeparationContext<'_>,
     clip: Option<&Mask>,
+    target_inks: &[&str],
 ) -> Result<f32> {
     let mut total_advance = 0.0;
     for element in array {
         match element {
             TextElement::String(text) => {
                 let advance = render_text_to_plate(
-                    pixmap,
+                    pixmaps,
                     text,
                     base_transform,
                     gs_stack,
@@ -1544,6 +1678,7 @@ fn render_tj_to_plate(
                     resources,
                     ctx,
                     clip,
+                    target_inks,
                 )?;
                 let gs_mut = gs_stack.current_mut();
                 let advance_matrix = Matrix::translation(advance, 0.0);
@@ -1672,19 +1807,29 @@ fn stroke_separation(
 }
 
 /// Apply a pending clip path to the clip stack.
+///
+/// The clip mask is identical across all plates — it depends only on the
+/// path, fill rule, current transform, and pixmap dimensions (which are
+/// shared). So we build it once and store it on the shared clip stack.
 fn apply_separation_clip(
     pending: &mut Option<(tiny_skia::Path, FillRule)>,
     clip_stack: &mut Vec<Option<Mask>>,
-    pixmap: &Pixmap,
+    pixmap_width: u32,
+    pixmap_height: u32,
     base_transform: Transform,
     gs_stack: &GraphicsStateStack,
 ) {
     if let Some((path, fill_rule)) = pending.take() {
+        // No pixmaps means no plates to clip — bail out early. Width/height
+        // would be zero and Mask::new would refuse them anyway.
+        if pixmap_width == 0 || pixmap_height == 0 {
+            return;
+        }
         let gs = gs_stack.current();
         let transform = combine_transforms(base_transform, &gs.ctm);
 
         if let Some(path_transformed) = path.transform(transform) {
-            let mut new_mask = Mask::new(pixmap.width(), pixmap.height()).unwrap();
+            let mut new_mask = Mask::new(pixmap_width, pixmap_height).unwrap();
             new_mask.fill_path(&path_transformed, fill_rule, true, Transform::identity());
 
             if let Some(Some(current_mask)) = clip_stack.last() {
