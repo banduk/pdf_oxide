@@ -230,6 +230,13 @@ impl PyPdfDocument {
     ///     region (tuple, optional): Bounding box (x, y, width, height) to restrict extraction
     ///     exclude_layers (list[str], optional): OCG layer names to exclude from extraction
     ///     exclude_inks (list[str], optional): Separation/DeviceN ink names to exclude
+    ///
+    /// Note:
+    ///     When ``exclude_layers`` or ``exclude_inks`` are specified, a simplified
+    ///     text assembly pipeline is used (no structure-tree ordering, table
+    ///     detection, or column detection). For precise results with complex
+    ///     layouts, use ``extract_chars()`` with the same filter parameters
+    ///     and assemble text from the positioned characters.
     #[pyo3(signature = (page, region=None, exclude_layers=None, exclude_inks=None))]
     fn extract_text(
         &mut self,

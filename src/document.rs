@@ -8652,9 +8652,19 @@ impl PdfDocument {
 
     /// Extract text from a page, excluding content from specified layers and inks.
     ///
-    /// Uses a simplified text assembly pipeline (no structure-tree ordering or
-    /// table detection). For most layer/ink filtering use cases this is
-    /// sufficient since the caller is performing targeted extraction.
+    /// # Text assembly differences
+    ///
+    /// This method uses a simplified text assembly pipeline compared to
+    /// [`extract_text`](Self::extract_text): spans are sorted by row-aware reading order and joined
+    /// with line breaks based on Y-gap heuristics. The full pipeline's
+    /// structure-tree ordering, table detection, and column detection are
+    /// **not** applied. This means:
+    /// - Multi-column layouts may interleave columns
+    /// - Tables will not be reconstructed
+    /// - Reading order depends on coordinate sorting, not document structure
+    ///
+    /// For precise spatial control, use [`extract_chars_filtered`](Self::extract_chars_filtered) and assemble
+    /// text yourself, or apply region filtering on top.
     ///
     /// **Ink filtering note:** For DeviceN color spaces, text is suppressed if
     /// ANY ink in the DeviceN array matches an excluded ink name. Tint values
