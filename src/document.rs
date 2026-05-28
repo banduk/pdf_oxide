@@ -4694,9 +4694,19 @@ impl PdfDocument {
         page_index: usize,
         options: &crate::converters::ConversionOptions,
     ) -> Result<String> {
+        let base_spans = self.extract_spans(page_index)?;
+        self.assemble_text_from_spans(page_index, base_spans, options)
+    }
+
+    fn assemble_text_from_spans(
+        &self,
+        page_index: usize,
+        base_spans: Vec<crate::layout::TextSpan>,
+        options: &crate::converters::ConversionOptions,
+    ) -> Result<String> {
         self.require_authenticated()?;
 
-        let mut base_spans = self.extract_spans(page_index)?;
+        let mut base_spans = base_spans;
 
         // Drop spans that fall inside any caller-specified exclusion region.
         // This runs before the structure-tree and table pipelines so that
@@ -7989,7 +7999,26 @@ impl PdfDocument {
     /// # }
     /// ```
     pub fn extract_spans(&self, page_index: usize) -> Result<Vec<crate::layout::TextSpan>> {
-        let mut spans = self.extract_spans_raw(page_index)?;
+        let spans = self.extract_spans_raw(page_index)?;
+        self.postprocess_spans(page_index, spans)
+    }
+
+    fn extract_spans_filtered(
+        &self,
+        page_index: usize,
+        excluded_layers: HashSet<String>,
+        excluded_inks: HashSet<String>,
+    ) -> Result<Vec<crate::layout::TextSpan>> {
+        let spans = self.extract_spans_raw_filtered(page_index, excluded_layers, excluded_inks)?;
+        self.postprocess_spans(page_index, spans)
+    }
+
+    fn postprocess_spans(
+        &self,
+        page_index: usize,
+        raw_spans: Vec<crate::layout::TextSpan>,
+    ) -> Result<Vec<crate::layout::TextSpan>> {
+        let mut spans = raw_spans;
 
         // Drop spans whose bbox lies entirely outside the page's MediaBox.
         // PDFs that reuse one big Form XObject across pages (ExpertPdf and
@@ -8652,19 +8681,9 @@ impl PdfDocument {
 
     /// Extract text from a page, excluding content from specified layers and inks.
     ///
-    /// # Text assembly differences
-    ///
-    /// This method uses a simplified text assembly pipeline compared to
-    /// [`extract_text`](Self::extract_text): spans are sorted by row-aware reading order and joined
-    /// with line breaks based on Y-gap heuristics. The full pipeline's
-    /// structure-tree ordering, table detection, and column detection are
-    /// **not** applied. This means:
-    /// - Multi-column layouts may interleave columns
-    /// - Tables will not be reconstructed
-    /// - Reading order depends on coordinate sorting, not document structure
-    ///
-    /// For precise spatial control, use [`extract_chars_filtered`](Self::extract_chars_filtered) and assemble
-    /// text yourself, or apply region filtering on top.
+    /// Uses the same full text assembly pipeline as [`extract_text`](Self::extract_text)
+    /// (structure-tree ordering, table detection, column detection), but with
+    /// layer/ink-excluded spans removed before assembly.
     ///
     /// **Ink filtering note:** For DeviceN color spaces, text is suppressed if
     /// ANY ink in the DeviceN array matches an excluded ink name. Tint values
@@ -8685,48 +8704,12 @@ impl PdfDocument {
             return self.extract_text(page_index);
         }
 
-        let mut spans =
-            self.extract_spans_raw_filtered(page_index, excluded_layers, excluded_inks)?;
-
-        // Apply media-box clipping (same as extract_spans)
-        if let Ok((llx, lly, urx, ury)) = self.get_page_media_box(page_index) {
-            const EDGE_TOLERANCE_PT: f32 = 2.0;
-            let left = llx - EDGE_TOLERANCE_PT;
-            let bottom = lly - EDGE_TOLERANCE_PT;
-            let right = urx + EDGE_TOLERANCE_PT;
-            let top = ury + EDGE_TOLERANCE_PT;
-            spans.retain(|span| {
-                let sx1 = span.bbox.x;
-                let sx2 = span.bbox.x + span.bbox.width;
-                let sy1 = span.bbox.y;
-                let sy2 = span.bbox.y + span.bbox.height;
-                sx2 > left && sx1 < right && sy2 > bottom && sy1 < top
-            });
-        }
-
-        // Row-aware reading order sort
-        spans.sort_by(|a, b| {
-            crate::utils::row_aware_span_cmp(a.bbox.y, a.bbox.x, b.bbox.y, b.bbox.x)
-        });
-
-        // Build text from spans
-        let mut text = String::new();
-        let mut last_y: Option<f32> = None;
-        for span in &spans {
-            if let Some(prev_y) = last_y {
-                let y_gap = (prev_y - span.bbox.y).abs();
-                if y_gap > span.bbox.height.max(1.0) * 0.5 {
-                    text.push('\n');
-                }
-            }
-            if !text.is_empty() && !text.ends_with('\n') && !text.ends_with(' ') {
-                text.push(' ');
-            }
-            text.push_str(&span.text);
-            last_y = Some(span.bbox.y);
-        }
-
-        Ok(text)
+        let spans = self.extract_spans_filtered(page_index, excluded_layers, excluded_inks)?;
+        let options = crate::converters::ConversionOptions {
+            extract_tables: true,
+            ..Default::default()
+        };
+        self.assemble_text_from_spans(page_index, spans, &options)
     }
 
     /// Extract text spans from a page using a specified reading order strategy.

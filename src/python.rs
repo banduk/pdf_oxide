@@ -232,11 +232,10 @@ impl PyPdfDocument {
     ///     exclude_inks (list[str], optional): Separation/DeviceN ink names to exclude
     ///
     /// Note:
-    ///     When ``exclude_layers`` or ``exclude_inks`` are specified, a simplified
-    ///     text assembly pipeline is used (no structure-tree ordering, table
-    ///     detection, or column detection). For precise results with complex
-    ///     layouts, use ``extract_chars()`` with the same filter parameters
-    ///     and assemble text from the positioned characters.
+    ///     When ``exclude_layers`` or ``exclude_inks`` are specified, the same
+    ///     full text assembly pipeline is used (structure-tree ordering, table
+    ///     detection, column detection) — excluded content is simply removed
+    ///     before assembly.
     #[pyo3(signature = (page, region=None, exclude_layers=None, exclude_inks=None))]
     fn extract_text(
         &mut self,
