@@ -8502,6 +8502,35 @@ impl PdfDocument {
             });
         }
 
+        // Apply page /Rotate to span geometry BEFORE reading-order sorting.
+        // Spans are extracted in raw PDF user space; a page with a /Rotate
+        // entry must be read in its DISPLAYED orientation or the row-aware
+        // sort emits text in the wrong order. /Rotate 180 mirrors both axes —
+        // pdf.js issue14415 is a 180-rotated English page that otherwise comes
+        // out fully word- AND line-reversed ("Authority" last, each line's
+        // words backwards), because the row-aware (Y-desc, X-asc) sort reads
+        // the un-rotated coordinates in reverse of display order. Each span's
+        // own text is already correct (a 180° page only flips span *order*),
+        // so mirroring span positions and re-sorting is sufficient. 90/270
+        // additionally require a width/height swap that interacts with column
+        // detection and table geometry, so they are left for a dedicated change.
+        if let Ok((llx, lly, urx, ury)) = self.get_page_media_box(page_index) {
+            let rot = self
+                .get_page_rotation(page_index)
+                .unwrap_or(0)
+                .rem_euclid(360);
+            if rot == 180 {
+                let w = urx - llx;
+                let h = ury - lly;
+                for s in spans.iter_mut() {
+                    let rel_x = s.bbox.x - llx;
+                    let rel_y = s.bbox.y - lly;
+                    s.bbox.x = llx + (w - (rel_x + s.bbox.width));
+                    s.bbox.y = lly + (h - (rel_y + s.bbox.height));
+                }
+            }
+        }
+
         // Reading order: XY-cut when the page has multiple columns (B4);
         // otherwise the cheap row-aware sort. XY-cut is spatial recursion
         // that correctly orders multi-column layouts (newspapers, academic
