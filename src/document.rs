@@ -698,6 +698,11 @@ impl PdfDocument {
         let (major, minor, header_offset) = parse_header(&mut reader, true)?;
         let version = (major, minor);
 
+        // Whether the xref table below came from a full-file reconstruction
+        // scan (vs. a parsed xref). Used to pre-seed the object-scan cache so
+        // a later miss doesn't rescan the whole file a second time (#572).
+        let mut xref_reconstructed = false;
+
         // Try to parse xref table normally
         let (mut xref, trailer) = match Self::try_open_regular(&mut reader) {
             Ok((xref, trailer)) => {
@@ -708,6 +713,7 @@ impl PdfDocument {
                     log::warn!(
                         "Regular xref parsing succeeded but table is empty, attempting reconstruction"
                     );
+                    xref_reconstructed = true;
                     Self::try_reconstruct_xref(&mut reader)?
                 } else {
                     // A valid xref can have any number of entries (§7.5.4).
@@ -723,6 +729,7 @@ impl PdfDocument {
                 match Self::try_reconstruct_xref(&mut reader) {
                     Ok((reconstructed_xref, reconstructed_trailer)) => {
                         log::info!("Successfully reconstructed xref table");
+                        xref_reconstructed = true;
                         (reconstructed_xref, reconstructed_trailer)
                     },
                     Err(recon_err) => {
@@ -771,11 +778,38 @@ impl PdfDocument {
                 "Root object not loadable after xref parse, falling back to xref reconstruction"
             );
             match Self::try_reconstruct_xref(&mut reader) {
-                Ok(result) => result,
+                Ok(result) => {
+                    xref_reconstructed = true;
+                    result
+                },
                 Err(_) => (xref, trailer), // Use original if reconstruction also fails
             }
         } else {
             (xref, trailer)
+        };
+
+        // #572: a reconstruction scan already located every uncompressed
+        // "N G obj" in the file, so a later scan_for_object full-file rescan
+        // (on the first object miss) would find nothing new — it just repeats
+        // the work, the ~25 s "first extract_text" cost on corrupt-xref
+        // polyglots. Pre-seed the scan-offset cache from the reconstructed
+        // table so that first miss is O(1). Only do this when reconstructed:
+        // a normal (parsed) xref may be legitimately partial, and there the
+        // full scan is the intended recovery path.
+        let prepopulated_scan: Option<HashMap<u32, u64>> = if xref_reconstructed {
+            Some(
+                xref.all_object_numbers()
+                    .filter_map(|id| {
+                        xref.get(id).and_then(|e| {
+                            (e.in_use
+                                && e.entry_type == crate::xref::XRefEntryType::Uncompressed)
+                                .then_some((id, e.offset))
+                        })
+                    })
+                    .collect(),
+            )
+        } else {
+            None
         };
 
         // Note: Encryption initialization was originally lazy, but decode_stream_with_encryption
@@ -802,7 +836,7 @@ impl PdfDocument {
             structure_content_cache: Mutex::new(None),
             page_cache: Mutex::new(HashMap::new()),
             page_cache_populated: AtomicBool::new(false),
-            scanned_object_offsets: Mutex::new(None),
+            scanned_object_offsets: Mutex::new(prepopulated_scan),
             objstm_recovery_done: Mutex::new(false),
             image_xobject_cache: Mutex::new(HashSet::new()),
             xobject_text_free_cache: Mutex::new(HashSet::new()),
@@ -15938,6 +15972,31 @@ mod tests {
         );
 
         pdf
+    }
+
+    // #572: a corrupt/zero startxref forces full-file xref reconstruction.
+    // Because reconstruction already scans the whole file for every
+    // uncompressed object, the document must pre-seed its object-scan cache
+    // from the reconstructed table — so the first object miss is O(1) instead
+    // of triggering a SECOND full-file scan (the heavy "first extract_text"
+    // cost on corrupt-xref polyglot PDFs).
+    #[test]
+    fn test_reconstructed_xref_preseeds_scan_cache() {
+        let pdf = b"%PDF-1.4\n\
+            1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+            2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+            trailer\n<< /Root 1 0 R /Size 3 >>\n\
+            startxref\n0\n%%EOF";
+        let doc = PdfDocument::from_bytes(pdf.to_vec()).expect("open corrupt-xref pdf");
+
+        let cache = doc.scanned_object_offsets.lock_or_recover();
+        let offsets = cache
+            .as_ref()
+            .expect("#572: reconstructed xref must pre-seed the scan-offset cache");
+        assert!(
+            offsets.contains_key(&1) && offsets.contains_key(&2),
+            "#572: pre-seeded cache should hold the reconstructed object offsets, got {offsets:?}"
+        );
     }
 
     // ========================================================================
