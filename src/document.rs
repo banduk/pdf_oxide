@@ -3664,11 +3664,16 @@ impl PdfDocument {
             }
         }
 
+        // §7.3.10: *any* element of the rectangle array may itself be an
+        // indirect reference (pdf.js issue7872 stores `/MediaBox
+        // [4 0 R 5 0 R 6 0 R 7 0 R]`). Resolve each element before
+        // coercing — otherwise an unresolved Reference reads as 0.0 and
+        // the page collapses to a zero-area box that clips all content.
         Ok((
-            to_f32(&media_box[0]),
-            to_f32(&media_box[1]),
-            to_f32(&media_box[2]),
-            to_f32(&media_box[3]),
+            to_f32(&self.resolve_obj_ref(&media_box[0])),
+            to_f32(&self.resolve_obj_ref(&media_box[1])),
+            to_f32(&self.resolve_obj_ref(&media_box[2])),
+            to_f32(&self.resolve_obj_ref(&media_box[3])),
         ))
     }
 
@@ -11880,17 +11885,22 @@ impl PdfDocument {
         }
 
         // Get MediaBox (required, may be inherited).
-        // PDF spec §7.3.10: any value may be a direct or indirect reference.
+        // PDF spec §7.3.10: any value may be a direct or indirect reference —
+        // including each individual array element (pdf.js issue7872 stores
+        // `/MediaBox [4 0 R 5 0 R 6 0 R 7 0 R]`). Resolve every element,
+        // otherwise an unresolved Reference reads as None and silently
+        // falls back to the Letter-size default instead of the true bounds.
         let media_box = page_dict
             .get("MediaBox")
             .map(|o| self.resolve_obj_ref(o))
             .as_ref()
             .and_then(|o| o.as_array().map(|a| a.to_owned()))
             .map(|arr| {
-                let x0 = arr.first().and_then(obj_to_f32).unwrap_or(0.0);
-                let y0 = arr.get(1).and_then(obj_to_f32).unwrap_or(0.0);
-                let x1 = arr.get(2).and_then(obj_to_f32).unwrap_or(612.0);
-                let y1 = arr.get(3).and_then(obj_to_f32).unwrap_or(792.0);
+                let r: Vec<Object> = arr.iter().map(|o| self.resolve_obj_ref(o)).collect();
+                let x0 = r.first().and_then(obj_to_f32).unwrap_or(0.0);
+                let y0 = r.get(1).and_then(obj_to_f32).unwrap_or(0.0);
+                let x1 = r.get(2).and_then(obj_to_f32).unwrap_or(612.0);
+                let y1 = r.get(3).and_then(obj_to_f32).unwrap_or(792.0);
                 crate::geometry::Rect::from_points(x0, y0, x1, y1)
             })
             .unwrap_or(crate::geometry::Rect::from_points(
@@ -11905,10 +11915,11 @@ impl PdfDocument {
             .as_ref()
             .and_then(|o| o.as_array().map(|a| a.to_owned()))
             .map(|arr| {
-                let x0 = arr.first().and_then(obj_to_f32).unwrap_or(0.0);
-                let y0 = arr.get(1).and_then(obj_to_f32).unwrap_or(0.0);
-                let x1 = arr.get(2).and_then(obj_to_f32).unwrap_or(612.0);
-                let y1 = arr.get(3).and_then(obj_to_f32).unwrap_or(792.0);
+                let r: Vec<Object> = arr.iter().map(|o| self.resolve_obj_ref(o)).collect();
+                let x0 = r.first().and_then(obj_to_f32).unwrap_or(0.0);
+                let y0 = r.get(1).and_then(obj_to_f32).unwrap_or(0.0);
+                let x1 = r.get(2).and_then(obj_to_f32).unwrap_or(612.0);
+                let y1 = r.get(3).and_then(obj_to_f32).unwrap_or(792.0);
                 crate::geometry::Rect::from_points(x0, y0, x1, y1)
             });
 
