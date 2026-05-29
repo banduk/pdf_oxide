@@ -4737,7 +4737,25 @@ impl PdfDocument {
     /// println!("Page 1 text: {}", text);
     /// # Ok::<(), pdf_oxide::error::Error>(())
     /// ```
-    /// Extract text from a page.
+    ///
+    /// # Extract text from a page
+    ///
+    /// pdf_oxide exposes three plain-text surfaces with different strengths
+    /// (#554). Pick by document shape:
+    ///
+    /// - `extract_text(page)` (this method) — glyph-walk assembly with
+    ///   row-aware ordering, inline table rendering, and artifact filtering.
+    ///   The most discoverable default; strongest on single-column prose.
+    /// - `to_plain_text(page, opts)` / `to_plain_text_all(opts)` — runs the
+    ///   full pipeline (reading-order strategy incl. XY-cut). Best on
+    ///   multi-column / complex layouts where reading order matters.
+    /// - `to_markdown_all(opts)` then strip markup — preserves structure
+    ///   (headings, lists, tables) and often scores highest on heavily
+    ///   structured documents; lossiest for pure prose.
+    ///
+    /// No single mode wins on every PDF; when extraction quality is critical
+    /// and the layout is unknown, compare `to_plain_text_all` and
+    /// markdown-stripped output and keep whichever is better for your corpus.
     pub fn extract_text(&self, page_index: usize) -> Result<String> {
         // Enable table extraction so that tabular content is preserved as
         // space-padded, column-aligned rows (see Table::render_text).
