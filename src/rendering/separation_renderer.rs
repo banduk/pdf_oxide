@@ -2333,6 +2333,21 @@ fn paint_image_to_plates(
         return Ok(());
     }
 
+    // §8.9.5: BitsPerComponent ∈ {1, 2, 4, 8, 16}. Channel extraction below
+    // assumes 8 bits per sample (one byte per channel per pixel) and would
+    // mis-read packed sub-byte or 16-bit streams. Until the routing path
+    // supports full BPC expansion, skip with a log entry — matching the
+    // JPX carve-out.
+    let bpc = pdf_image.bits_per_component();
+    if bpc != 8 {
+        log::warn!(
+            "Skipping image XObject '{name}' on separation plates: \
+             BitsPerComponent={bpc} not supported (only 8-bpc channel \
+             routing is implemented; 1/2/4/16-bpc expansion pending)"
+        );
+        return Ok(());
+    }
+
     let extractor_cs = pdf_image.color_space();
 
     // Extract interleaved raw samples in the source colour space. The
@@ -2377,6 +2392,12 @@ fn paint_image_to_plates(
     };
     let _ = color_state; // currently unused outside the image-mask path
 
+    // §8.9.5.2: /Decode maps raw sample values into the colour space's range.
+    // For per-plate routing the colour space is treated as identity, so the
+    // only effect that matters is inversion (`/Decode [1 0]` on a Separation
+    // image, etc.). Default identity is `[0 1]` per channel.
+    let decode = read_decode_array(dict, stride);
+
     let gs = gs_stack.current();
     let transform = combine_transforms(base_transform, &gs.ctm);
 
@@ -2387,10 +2408,83 @@ fn paint_image_to_plates(
         if channel_idx >= stride {
             continue;
         }
-        let plane = extract_image_channel(&samples, pixel_count, stride, channel_idx);
+        let mut plane = extract_image_channel(&samples, pixel_count, stride, channel_idx);
+        if let Some(decode_pairs) = decode.as_ref() {
+            if let Some(&(dmin, dmax)) = decode_pairs.get(channel_idx) {
+                apply_decode_to_plane(&mut plane, dmin, dmax);
+            }
+        }
         blit_image_plane_to_plate(&mut pixmaps[i], &plane, w as u32, h as u32, transform, clip);
     }
     Ok(())
+}
+
+/// Expand a 1-bpc packed bitmap into one byte per pixel (0 or 255).
+///
+/// Per §8.9.5.1 each row is packed MSB-first into `ceil(width / 8)` bytes;
+/// trailing bits in the final byte of each row are padding. Used to
+/// normalise `/ImageMask true` stencils before they're blitted onto plates.
+fn expand_1bpc_to_8bpc(packed: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let row_bytes = width.div_ceil(8) as usize;
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = Vec::with_capacity(w * h);
+    for row in 0..h {
+        let row_start = row * row_bytes;
+        for col in 0..w {
+            let byte_idx = row_start + col / 8;
+            let bit_idx = 7 - (col % 8);
+            let bit = packed
+                .get(byte_idx)
+                .map(|b| (*b >> bit_idx) & 1)
+                .unwrap_or(0);
+            out.push(if bit == 1 { 255 } else { 0 });
+        }
+    }
+    out
+}
+
+/// Read the image's `/Decode` array as per-channel `(dmin, dmax)` pairs.
+/// Returns `None` if the entry is absent or malformed; callers fall back
+/// to the identity mapping (no remap).
+fn read_decode_array(
+    dict: &HashMap<String, Object>,
+    num_components: usize,
+) -> Option<Vec<(f32, f32)>> {
+    let decode = dict.get("Decode")?;
+    let arr = decode.as_array()?;
+    if arr.len() < num_components * 2 {
+        return None;
+    }
+    let to_f32 = |o: &Object| -> Option<f32> {
+        match o {
+            Object::Real(r) => Some(*r as f32),
+            Object::Integer(i) => Some(*i as f32),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(num_components);
+    for i in 0..num_components {
+        let dmin = to_f32(&arr[i * 2])?;
+        let dmax = to_f32(&arr[i * 2 + 1])?;
+        out.push((dmin, dmax));
+    }
+    Some(out)
+}
+
+/// Apply a single channel's `/Decode` pair to an extracted 8-bpc plane.
+///
+/// For the identity mapping (`dmin = 0`, `dmax = 1`) this is a no-op. For
+/// `[1 0]` this inverts the plane (raw 0 → 1.0 → 255, raw 255 → 0.0 → 0).
+fn apply_decode_to_plane(plane: &mut [u8], dmin: f32, dmax: f32) {
+    if dmin == 0.0 && dmax == 1.0 {
+        return;
+    }
+    for byte in plane.iter_mut() {
+        let raw = *byte as f32 / 255.0;
+        let decoded = (dmin + raw * (dmax - dmin)).clamp(0.0, 1.0);
+        *byte = (decoded * 255.0).round() as u8;
+    }
 }
 
 /// Paint an image mask (`/ImageMask true`) into the separation plates.
@@ -2414,36 +2508,59 @@ fn paint_image_mask_to_plates(
     clip: Option<&Mask>,
     target_inks: &[&str],
 ) -> Result<()> {
-    use crate::extractors::images::{extract_image_from_xobject, ImageData};
-
-    let pdf_image =
-        match extract_image_from_xobject(Some(ctx.doc), xobject, obj_ref, Some(color_spaces)) {
-            Ok(img) => img,
-            Err(e) => {
-                log::warn!("Skipping image mask '{name}': {e}");
-                return Ok(());
-            },
-        };
-    let w = pdf_image.width() as usize;
-    let h = pdf_image.height() as usize;
+    // §8.9.6.2 ImageMask: the dict has no /ColorSpace, so the standard
+    // image-extraction path rejects it. Read width/height/bpc directly from
+    // the dict and decode the stream ourselves.
+    let dict = match xobject {
+        Object::Stream { dict, .. } => dict,
+        _ => return Ok(()),
+    };
+    let w = dict
+        .get("Width")
+        .and_then(|o| o.as_integer())
+        .unwrap_or(0) as usize;
+    let h = dict
+        .get("Height")
+        .and_then(|o| o.as_integer())
+        .unwrap_or(0) as usize;
     let pixel_count = w * h;
     if pixel_count == 0 {
         return Ok(());
     }
+    let bpc = dict
+        .get("BitsPerComponent")
+        .and_then(|o| o.as_integer())
+        .unwrap_or(1) as u8;
+    if bpc != 1 {
+        log::warn!(
+            "Skipping image mask '{name}': BitsPerComponent={bpc} out of spec \
+             (§8.9.6.2 mandates 1-bpc)"
+        );
+        return Ok(());
+    }
 
-    // The extractor stores a 1-bpc bilevel image as `PixelFormat::Grayscale`
-    // with one byte per pixel (0 or 255). Whichever interpretation it
-    // produced, an opaque pixel == 255 paints, 0 leaves the destination
-    // untouched.
-    let stencil = match pdf_image.data() {
-        ImageData::Raw { pixels, .. } => pixels.clone(),
-        ImageData::Jpeg(_) => {
-            log::debug!("Image mask '{name}' decoded as JPEG, unexpected; skipping");
-            return Ok(());
-        },
+    let packed = if let Some(r) = obj_ref {
+        ctx.doc.decode_stream_with_encryption(xobject, r)?
+    } else {
+        xobject.decode_stream_data()?
     };
+    let mut stencil = expand_1bpc_to_8bpc(&packed, w as u32, h as u32);
     if stencil.len() < pixel_count {
         return Ok(());
+    }
+
+    // §8.9.6.2: decoded sample value 0 marks the pixel with the current
+    // colour; value 1 leaves it transparent. /Decode defaults to [0 1] —
+    // applied here so /Decode [1 0] correctly inverts the stencil — then we
+    // map decoded → alpha as `255 - decoded` so the existing SourceOver
+    // composite paints where the spec says to paint.
+    if let Some(decode_pairs) = read_decode_array(dict, 1) {
+        if let Some(&(dmin, dmax)) = decode_pairs.first() {
+            apply_decode_to_plane(&mut stencil, dmin, dmax);
+        }
+    }
+    for byte in stencil.iter_mut() {
+        *byte = 255 - *byte;
     }
 
     let gs = gs_stack.current();
