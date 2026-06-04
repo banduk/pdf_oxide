@@ -145,7 +145,11 @@ fn horizontal_identity_h_emits_x_advancing_spans() {
 }
 
 /// Vertical extraction (Identity-V) must advance along the y-axis instead
-/// of the x-axis. The three glyphs must stack downward at a stable X.
+/// of the x-axis. The three glyphs must stack downward at a stable X,
+/// and the per-glyph Y delta must equal exactly `-font_size * w1y / 1000`
+/// per ISO 32000-1 §9.4.4. `extract_chars` exposes per-glyph positions
+/// without the per-span buffer coalescing, making this delta directly
+/// observable.
 #[test]
 fn vertical_identity_v_emits_y_advancing_spans() {
     let pdf = build_pdf_with_encoding("Identity-V");
@@ -161,6 +165,26 @@ fn vertical_identity_v_emits_y_advancing_spans() {
         combined.contains('A') && combined.contains('B') && combined.contains('C'),
         "expected A, B, C in vertical extraction; got {:?}",
         combined
+    );
+
+    // Pin per-glyph Y delta to the spec formula: w1y=-1000 at fs=12 ⇒
+    // 12.0 step per glyph. extract_chars bypasses the buffer so each
+    // glyph's user-space origin is preserved.
+    let chars = doc.extract_chars(0).expect("extract chars");
+    let a = chars.iter().find(|c| c.char == 'A').expect("A char");
+    let b = chars.iter().find(|c| c.char == 'B').expect("B char");
+    let c = chars.iter().find(|c| c.char == 'C').expect("C char");
+    let dy_ab = a.bbox.y - b.bbox.y;
+    let dy_bc = b.bbox.y - c.bbox.y;
+    assert!(
+        (dy_ab - 12.0).abs() < 0.01,
+        "expected per-glyph Y delta exactly 12.0 (font_size * |w1y|/1000); got {} between A,B",
+        dy_ab
+    );
+    assert!(
+        (dy_bc - 12.0).abs() < 0.01,
+        "expected per-glyph Y delta exactly 12.0; got {} between B,C",
+        dy_bc
     );
 
     // The span bbox is captured at the cursor's user-space position when

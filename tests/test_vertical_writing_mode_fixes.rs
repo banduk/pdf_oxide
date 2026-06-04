@@ -472,6 +472,245 @@ end";
     );
 }
 
+// ---------------------------------------------------------------------------
+// Per-CID /W2 fixture: per-CID (w1y, v_x, v_y) overrides /DW2
+// ---------------------------------------------------------------------------
+
+/// A Type0 font with explicit per-CID /W2 metrics that disagree with
+/// /DW2 must use the per-CID values for the listed CIDs and the /DW2
+/// defaults for unlisted CIDs. This pins the /W2 lookup wiring all the
+/// way through to extract_chars positioning.
+#[test]
+fn per_cid_w2_overrides_dw2_for_listed_cids() {
+    // /DW2 says w1y=-1000 for every CID by default. /W2 [1 [-500 250 600]]
+    // overrides CID 1 (only) to w1y=-500. Two glyphs:
+    //   CID 1: per-CID override, advance |w1y|*fs/1000 = 6.0 at fs=12.
+    //   CID 2: falls back to /DW2 default, advance = 12.0.
+    let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj <0002> Tj ET";
+    let pdf = build_pdf(
+        "Identity-V",
+        content,
+        1000,
+        (880, -1000),
+        Some("[1 [-500 250 600]]"),
+        None,
+        None,
+    );
+    let doc = PdfDocument::from_bytes(pdf).expect("parse per-CID /W2 PDF");
+    let chars = doc.extract_chars(0).expect("extract chars");
+
+    let a = chars
+        .iter()
+        .find(|c| c.char == 'A')
+        .expect("expected an 'A' char");
+    let b = chars
+        .iter()
+        .find(|c| c.char == 'B')
+        .expect("expected a 'B' char");
+
+    // A starts at y=700. After CID 1 (per-CID w1y=-500) advances the
+    // cursor by 6 units, B sits at y=694.
+    let dy = a.bbox.y - b.bbox.y;
+    assert!(
+        (dy - 6.0).abs() < 0.5,
+        "per-CID /W2 must override /DW2 for CID 1: expected dy ~6, got {} (A.y={}, B.y={})",
+        dy,
+        a.bbox.y,
+        b.bbox.y
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mid-stream Tf H↔V switch: the font change must re-tag span wmode.
+// ---------------------------------------------------------------------------
+
+/// A content stream that swaps a horizontal font for a vertical font
+/// (or vice versa) mid-stream via Tf must correctly track the active
+/// wmode for spans emitted on each side of the switch.
+#[test]
+fn mid_stream_tf_h_to_v_switches_span_wmode() {
+    // Build a PDF carrying two fonts: F1 Identity-H, F2 Identity-V,
+    // both with the same ToUnicode mapping <0001>→A and <0002>→B.
+    let cmap = b"\
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+2 beginbfchar
+<0001> <0041>
+<0002> <0042>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end";
+    // Two BT/ET blocks: the first paints A under Identity-H (F1), the
+    // second paints B under Identity-V (F2). Using separate BT/ET blocks
+    // sidesteps any in-flight buffer coalescing.
+    let content = b"BT /F1 12 Tf 100 700 Td <0001> Tj ET BT /F2 12 Tf 200 600 Td <0002> Tj ET";
+
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let o1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+    let o2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n");
+    let o3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] \
+          /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 8 0 R >> >> >> endobj\n",
+    );
+    let o4 = pdf.len();
+    pdf.extend_from_slice(format!("4 0 obj << /Length {} >> stream\n", content.len()).as_bytes());
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let o5 = pdf.len();
+    pdf.extend_from_slice(
+        b"5 0 obj << /Type /Font /Subtype /Type0 /BaseFont /TestH \
+          /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >> endobj\n",
+    );
+    let o6 = pdf.len();
+    pdf.extend_from_slice(
+        b"6 0 obj << /Type /Font /Subtype /CIDFontType2 /BaseFont /TestH \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /DW 1000 /DW2 [880 -1000] >> endobj\n",
+    );
+    let o7 = pdf.len();
+    pdf.extend_from_slice(format!("7 0 obj << /Length {} >> stream\n", cmap.len()).as_bytes());
+    pdf.extend_from_slice(cmap);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let o8 = pdf.len();
+    pdf.extend_from_slice(
+        b"8 0 obj << /Type /Font /Subtype /Type0 /BaseFont /TestV \
+          /Encoding /Identity-V /DescendantFonts [9 0 R] /ToUnicode 7 0 R >> endobj\n",
+    );
+    let o9 = pdf.len();
+    pdf.extend_from_slice(
+        b"9 0 obj << /Type /Font /Subtype /CIDFontType2 /BaseFont /TestV \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+          /DW 1000 /DW2 [880 -1000] >> endobj\n",
+    );
+    let xref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 10\n0000000000 65535 f \n");
+    for off in [o1, o2, o3, o4, o5, o6, o7, o8, o9] {
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer << /Size 10 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            xref
+        )
+        .as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(pdf).expect("parse mid-stream Tf PDF");
+    let spans = doc.extract_spans(0).expect("extract spans");
+
+    let a = spans.iter().find(|s| s.text.contains('A')).expect("A span");
+    let b = spans.iter().find(|s| s.text.contains('B')).expect("B span");
+    assert_eq!(a.wmode, 0, "A drawn under Identity-H must report wmode=0");
+    assert_eq!(b.wmode, 1, "B drawn under Identity-V must report wmode=1");
+}
+
+// ---------------------------------------------------------------------------
+// High-CID per-/W2: lookup works for CID > 256
+// ---------------------------------------------------------------------------
+
+/// Adobe-Japan1 CIDs can run into the thousands. A /W2 entry assigning
+/// per-CID metrics to a CID > 256 must look up correctly via the
+/// extractor's vertical advance path.
+#[test]
+fn high_cid_w2_lookup_works() {
+    // The fixture uses CID 0x0500 (1280, well past 256) with a per-CID
+    // w1y=-500 override. With /DW = 1000 the horizontal width is the
+    // /DW default; only the vertical metric is overridden.
+    let cmap = b"\
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+2 beginbfchar
+<0500> <0041>
+<0501> <0042>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end";
+    let content = b"BT /F1 12 Tf 100 700 Td <0500> Tj <0501> Tj ET";
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let o1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+    let o2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n");
+    let o3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] \
+          /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n",
+    );
+    let o4 = pdf.len();
+    pdf.extend_from_slice(format!("4 0 obj << /Length {} >> stream\n", content.len()).as_bytes());
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let o5 = pdf.len();
+    pdf.extend_from_slice(
+        b"5 0 obj << /Type /Font /Subtype /Type0 /BaseFont /TestHigh \
+          /Encoding /Identity-V /DescendantFonts [6 0 R] /ToUnicode 7 0 R >> endobj\n",
+    );
+    let o6 = pdf.len();
+    pdf.extend_from_slice(
+        b"6 0 obj << /Type /Font /Subtype /CIDFontType2 /BaseFont /TestHigh \
+          /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >> \
+          /DW 1000 /DW2 [880 -1000] /W2 [1280 [-500 250 600]] >> endobj\n",
+    );
+    let o7 = pdf.len();
+    pdf.extend_from_slice(format!("7 0 obj << /Length {} >> stream\n", cmap.len()).as_bytes());
+    pdf.extend_from_slice(cmap);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+    for off in [o1, o2, o3, o4, o5, o6, o7] {
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer << /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            xref
+        )
+        .as_bytes(),
+    );
+
+    let doc = PdfDocument::from_bytes(pdf).expect("parse high-CID PDF");
+    let chars = doc.extract_chars(0).expect("extract chars");
+    let a = chars
+        .iter()
+        .find(|c| c.char == 'A')
+        .expect("expected A from CID 0x0500");
+    let b = chars
+        .iter()
+        .find(|c| c.char == 'B')
+        .expect("expected B from CID 0x0501");
+    // CID 1280 (0x0500) has per-CID w1y=-500 ⇒ advance 6.0.
+    // CID 1281 (0x0501) falls back to /DW2 ⇒ advance 12.0.
+    let dy = a.bbox.y - b.bbox.y;
+    assert!(
+        (dy - 6.0).abs() < 0.5,
+        "high-CID /W2 lookup must use per-CID metric; expected dy ~6, got {}",
+        dy
+    );
+}
+
 /// Counter-test: a vertical /Encoding (Identity-V) with a ToUnicode that has
 /// no /WMode directive must still produce wmode=1.
 #[test]
