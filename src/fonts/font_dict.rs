@@ -1134,16 +1134,32 @@ impl FontInfo {
             })
             .unwrap_or(default_descent);
 
-        // Final writing-mode resolution. Precedence (highest first):
-        //   1. /WMode 1 def inside the ToUnicode CMap stream (when present).
-        //   2. /WMode 1 def inside the /Encoding CMap stream OR a -V suffix
-        //      on the predefined encoding name (resolved in `encoding_wmode`).
-        // The ToUnicode override is included because some writers emit a
-        // horizontal /Encoding (Identity-H) but pair it with a ToUnicode
-        // CMap that explicitly declares vertical writing; in practice this
-        // is rare but the spec permits it (§9.7.5.4).
-        let tu_wmode = to_unicode.as_ref().map(|c| c.wmode()).unwrap_or(0);
-        let wmode = if tu_wmode == 1 { 1 } else { encoding_wmode };
+        // Final writing-mode resolution.
+        //
+        // Per ISO 32000-1:2008 §9.10.2 the ToUnicode CMap is for
+        // extraction-time character → Unicode mapping ONLY. The active
+        // writing mode is determined by the /Encoding CMap (§9.7.5):
+        // either an embedded `/WMode 1 def` directive or a predefined
+        // encoding name whose suffix is `-V`. Consulting the ToUnicode
+        // CMap's `/WMode` here would silently flip a horizontal document
+        // to vertical whenever a producer left a stale `/WMode 1 def`
+        // in the ToUnicode prologue — a real-world tooling failure mode.
+        //
+        // We still emit a debug log when ToUnicode disagrees with the
+        // /Encoding so producer bugs are diagnosable.
+        let wmode = encoding_wmode;
+        if let Some(tu) = to_unicode.as_ref() {
+            let tu_wmode = tu.wmode();
+            if tu_wmode != encoding_wmode {
+                log::debug!(
+                    "Font '{}': ToUnicode CMap declares /WMode {} but /Encoding wmode is {}. \
+                     Honoring /Encoding per ISO 32000-1 §9.10.2.",
+                    base_font,
+                    tu_wmode,
+                    encoding_wmode
+                );
+            }
+        }
 
         Ok(FontInfo {
             base_font,
