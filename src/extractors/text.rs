@@ -5029,10 +5029,12 @@ impl<'doc> TextExtractor<'doc> {
                                         }
                                     }
 
-                                    let state_mut = self.state_stack.current_mut();
-                                    let tm = state_mut.text_matrix;
-                                    state_mut.text_matrix.e += tx * tm.a;
-                                    state_mut.text_matrix.f += tx * tm.b;
+                                    // Route through advance_text_matrix so the
+                                    // axis swap (H vs V) lives in one place.
+                                    // Per ISO 32000-1 §9.4.4 a TJ numeric
+                                    // offset shifts along the active writing
+                                    // axis: x for WMode 0, y for WMode 1.
+                                    self.state_stack.current_mut().advance_text_matrix(tx);
                                 },
                             }
                         }
@@ -7900,6 +7902,7 @@ impl<'doc> TextExtractor<'doc> {
         let word_space = state.word_space;
         let fill_color_rgb = state.fill_color_rgb;
         let ctm = state.ctm;
+        let wmode = state.text_wmode;
 
         // Get current font from cached reference
         let font = self.cached_current_font.as_deref();
@@ -7945,17 +7948,30 @@ impl<'doc> TextExtractor<'doc> {
             let hs_factor = horizontal_scaling / 100.0;
             let glyph_width_user_space = glyph_width_font_units * fs_factor * hs_factor;
 
-            // Advance position: Tx = (w0 * Tfs + Tc + Tw) * Th
-            let mut tx = glyph_width_user_space;
-            tx += char_space * hs_factor;
-            if char_code == 32 {
-                tx += word_space * hs_factor;
-            }
+            // Advance along the active writing axis per ISO 32000-1 §9.4.4:
+            //   horizontal: tx = (w0 * Tfs + Tc + Tw) * Th
+            //   vertical:   ty = w1y * Tfs + Tc + Tw    (NO Th — Tz is a
+            //               glyph-stretching factor on the X axis only;
+            //               see §9.3.4).
+            let mut tx = if wmode == 0 {
+                glyph_width_user_space
+                    + char_space * hs_factor
+                    + if char_code == 32 { word_space * hs_factor } else { 0.0 }
+            } else {
+                let w1y = font
+                    .map(|f| f.get_vertical_metrics(char_code).w1y)
+                    .unwrap_or(crate::fonts::VerticalMetrics::SPEC_DEFAULT.w1y);
+                w1y * fs_factor
+                    + char_space
+                    + if char_code == 32 { word_space } else { 0.0 }
+            };
 
             // For TextChar, we use the device-space width
             let glyph_width_device_space = glyph_width_user_space * combined_char.a.abs();
             let tx_device_space = tx * combined_char.a.abs();
             let height_device_space = effective_font_size;
+            // Quiet unused-mut warning when wmode != 0 and tx is read-only after this point.
+            let _ = &mut tx;
 
             // Determine font weight and style
             let (font_weight, is_italic_char) = if let Some(font) = font {
@@ -8060,11 +8076,10 @@ impl<'doc> TextExtractor<'doc> {
                 }
             }
 
-            // Update text matrix in current state per ISO 32000-1:2008 §9.4.4
-            let state_mut = self.state_stack.current_mut();
-            let tm = state_mut.text_matrix;
-            state_mut.text_matrix.e += tx * tm.a;
-            state_mut.text_matrix.f += tx * tm.b;
+            // Update text matrix per ISO 32000-1:2008 §9.4.4. The axis swap
+            // (x for WMode 0, y for WMode 1) is encapsulated in
+            // advance_text_matrix so this site does not branch.
+            self.state_stack.current_mut().advance_text_matrix(tx);
         }
 
         Ok(())
