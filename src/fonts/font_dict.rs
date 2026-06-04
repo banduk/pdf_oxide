@@ -115,6 +115,11 @@ pub struct FontInfo {
     /// Index by byte value (0-255). '\0' means "use full char_to_unicode fallback".
     /// Built lazily on first text decode. Avoids per-byte HashMap lookups.
     pub byte_to_char_table: std::sync::OnceLock<[char; 256]>,
+    /// Per-font memo of `char_to_unicode`. Type0/CID fonts have no
+    /// `byte_to_char_table`, so without this each glyph re-runs the decode
+    /// cascade. `Arc<Mutex<…>>` keeps `FontInfo: Clone` (clones share the memo).
+    pub type0_unicode_memo:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Option<String>>>>,
     /// Pre-computed byte→width lookup for simple (non-Type0) fonts.
     /// Index by byte value (0-255). Built lazily on first advance_position call.
     /// Eliminates per-byte bounds check and subtraction in get_glyph_width.
@@ -1027,6 +1032,9 @@ impl FontInfo {
             cff_gid_map,
             multi_char_map: diff_multi_char_map,
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names,
         })
@@ -3133,6 +3141,22 @@ impl FontInfo {
     /// inspects surrounding context (neighboring chars, word boundaries) to
     /// decide whether to split — keeping font_dict a pure encoding layer.
     pub fn char_to_unicode(&self, char_code: u32) -> Option<String> {
+        // Serve from the per-font memo. Read and write are separate lock scopes
+        // so the decode in between never holds the lock.
+        if let Ok(memo) = self.type0_unicode_memo.lock() {
+            if let Some(cached) = memo.get(&char_code) {
+                return cached.clone();
+            }
+        }
+        let result = self.char_to_unicode_uncached(char_code);
+        if let Ok(mut memo) = self.type0_unicode_memo.lock() {
+            memo.insert(char_code, result.clone());
+        }
+        result
+    }
+
+    /// Uncached decode cascade behind [`Self::char_to_unicode`].
+    fn char_to_unicode_uncached(&self, char_code: u32) -> Option<String> {
         // char_code is now u32 to support 4-byte character codes (0x00000000-0xFFFFFFFF)
         // This is backward compatible - u16 values are automatically promoted to u32
 
@@ -3157,13 +3181,22 @@ impl FontInfo {
         if let Some(lazy_cmap) = &self.to_unicode {
             if let Some(cmap) = lazy_cmap.get() {
                 let raw_unicode = cmap.get(&char_code);
+                let had_hit = raw_unicode.is_some();
 
-                // For Identity-encoded fonts, a U+FFFD result coming from a notdefrange
-                // entry is NOT a definitive mapping — the CID-as-Unicode path gives the
-                // correct character (CID == Unicode codepoint). Treat it as a CMap miss
-                // so we fall through to the Identity fallback below.
-                let effective_hit = raw_unicode
-                    .filter(|u| *u != "\u{FFFD}" || !matches!(self.encoding, Encoding::Identity));
+                // For Identity-encoded fonts, a U+FFFD (notdefrange) or a BMP
+                // noncharacter (U+FFFE / U+FFFF) result is NOT a definitive
+                // mapping — some producers stuff these into ToUnicode as a
+                // "no glyph" placeholder (arial_unicode_ab_cidfont maps every
+                // CID to U+FFFF). The CID→GID→embedded-cmap / CID-as-Unicode
+                // fallback below recovers the real character, so treat them as a
+                // CMap miss. Noncharacters are permanently reserved and never
+                // valid text, so this can only ever improve Identity-font output.
+                let effective_hit = raw_unicode.filter(|u| {
+                    let is_placeholder = !u.is_empty()
+                        && u.chars()
+                            .all(|c| matches!(c, '\u{FFFD}' | '\u{FFFE}' | '\u{FFFF}'));
+                    !(is_placeholder && matches!(self.encoding, Encoding::Identity))
+                });
 
                 if let Some(unicode) = effective_hit {
                     // Fix B: filter bare C0 control characters (U+0000–U+001F except
@@ -3176,7 +3209,7 @@ impl FontInfo {
                         .all(|c| matches!(c as u32, 0x00..=0x08 | 0x0B..=0x0C | 0x0E..=0x1F))
                         && !unicode.is_empty();
 
-                    if unicode == "\u{FFFD}" {
+                    if unicode.as_ref() == "\u{FFFD}" {
                         log::debug!(
                             "ToUnicode CMap has U+FFFD for code 0x{:02X} in font '{}' - returning U+FFFD",
                             char_code, self.base_font
@@ -3197,7 +3230,7 @@ impl FontInfo {
                         // embedded post/charset table), prefer the §9.10.2(a)+(b) AGL
                         // result. Gated so a correctly-mapped period (whose hit is
                         // already `.`) never enters here.
-                        if is_non_sensible_symbol(unicode) {
+                        if is_non_sensible_symbol(&unicode) {
                             if let Some(glyph_name) = self.glyph_name_for_code(char_code) {
                                 if let Some(punct) = punctuation_unicode_for_glyph_name(glyph_name)
                                 {
@@ -3209,10 +3242,10 @@ impl FontInfo {
                                 }
                             }
                         }
-                        return Some(unicode.clone());
+                        return Some(unicode.into_owned());
                     }
                 } else {
-                    if raw_unicode.is_some() {
+                    if had_hit {
                         log::debug!(
                             "Identity font '{}': notdefrange U+FFFD treated as miss for code 0x{:04X} — falling through to CID-as-Unicode",
                             self.base_font, char_code
@@ -4623,6 +4656,11 @@ fn symbol_encoding_lookup(code: u8) -> Option<char> {
         0x7D => Some('}'), // braceright
         0x7E => Some('∼'), // similar
 
+        // Math operators previously missing from the Adobe Symbol set (Annex D.5).
+        0xA3 => Some('\u{2264}'), // ≤ lessequal    (octal 243)
+        0xA5 => Some('\u{221E}'), // ∞ infinity     (octal 245)
+        0xB3 => Some('\u{2265}'), // ≥ greaterequal (octal 263)
+
         _ => None,
     }
 }
@@ -4747,6 +4785,21 @@ fn zapf_dingbats_encoding_lookup(code: u8) -> Option<char> {
         0x78 => Some('▩'), // square with diagonal crosshatch fill
         0x79 => Some('▪'), // black small square
         0x7A => Some('▫'), // white small square
+
+        // Circled digits (Annex D.6, octal 254–323), previously dropped. Codes
+        // are the spec's octal CODE in hex; each range is contiguous in Unicode.
+        0xAC..=0xB5 => char::from_u32(0x2460 + (code as u32 - 0xAC)), // ① ⑩  a120 a129
+        0xB6..=0xBF => char::from_u32(0x2776 + (code as u32 - 0xB6)), // ❶ ❿  a130 a139
+        0xC0..=0xC9 => char::from_u32(0x2780 + (code as u32 - 0xC0)), // ➀ ➉  a140 a149
+        0xCA..=0xD3 => char::from_u32(0x278A + (code as u32 - 0xCA)), // ➊ ➓  a150 a159
+
+        // Arrows (Annex D.6, octal 324–376): four singletons, then two runs.
+        0xD4 => Some('\u{2794}'), // ➔ a160  heavy wide-headed rightwards arrow
+        0xD5 => Some('\u{2192}'), // → a161  rightwards arrow
+        0xD6 => Some('\u{2194}'), // ↔ a163  left right arrow
+        0xD7 => Some('\u{2195}'), // ↕ a164  up down arrow
+        0xD8..=0xEF => char::from_u32(0x2798 + (code as u32 - 0xD8)), // ➘ ➯  a196…a182
+        0xF1..=0xFE => char::from_u32(0x27B1 + (code as u32 - 0xF1)), // ➱ ➾  a201…a191
 
         _ => None,
     }
@@ -5252,6 +5305,9 @@ fn lookup_predefined_cmap(
         "Japan1" => CID_MAX_JAPAN1,
         "CNS1" => CID_MAX_CNS1,
         "Korea1" => CID_MAX_KOREA1,
+        // Adobe-Arabic-1 / Adobe-Persian-1: `lookup_adobe_arabic` rejects
+        // unmapped CIDs itself, so the bound is just an early-out.
+        "Arabic" | "Persian" => u16::MAX,
         _ => return None,
     };
     if cid > max_cid {
@@ -5278,6 +5334,10 @@ fn lookup_predefined_cmap(
         (_, "Japan1") => lookup_adobe_japan1_to_unicode(cid),
         (_, "CNS1") => lookup_adobe_cns1_to_unicode(cid),
         (_, "Korea1") => lookup_adobe_korea1_to_unicode(cid),
+        // Adobe-Arabic-1 / Adobe-Persian-1 CIDFonts without /ToUnicode (Nazanin,
+        // Yagut, Mitra, Lotus). `lookup_adobe_arabic` is the §9.10.3 step-3
+        // identity fallback; without it these decode as Latin-Extended-B garbage.
+        (_, "Arabic") | (_, "Persian") => crate::fonts::cid_mappings::lookup_adobe_arabic(cid),
         _ => None,
     }
 }
@@ -5386,6 +5446,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5419,6 +5482,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5455,6 +5521,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5488,6 +5557,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5527,6 +5599,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5567,6 +5642,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5606,6 +5684,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5643,6 +5724,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5778,6 +5862,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5903,6 +5990,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5946,6 +6036,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -5982,6 +6075,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6022,6 +6118,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6058,6 +6157,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6094,6 +6196,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6134,6 +6239,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6170,6 +6278,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6206,6 +6317,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6246,6 +6360,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6281,6 +6398,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6316,6 +6436,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6351,6 +6474,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6386,6 +6512,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6421,6 +6550,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6456,6 +6588,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6491,6 +6626,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6526,6 +6664,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6809,6 +6950,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6856,6 +7000,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6899,6 +7046,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -6952,6 +7102,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -7002,6 +7155,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -7409,6 +7565,36 @@ mod tests {
     fn test_zapf_dingbats_geometric() {
         assert_eq!(zapf_dingbats_encoding_lookup(0x6C), Some('●')); // black circle
         assert_eq!(zapf_dingbats_encoding_lookup(0x6F), Some('■')); // black square
+    }
+
+    /// ZapfDingbats circled-digit ranges (Annex D.6); codes in hex of the
+    /// spec's octal CODE column.
+    #[test]
+    fn test_zapf_dingbats_circled_digits() {
+        // ① ⑩  (a120–a129, octal 254–265) → U+2460–U+2469
+        assert_eq!(zapf_dingbats_encoding_lookup(0xAC), Some('\u{2460}')); // ①
+        assert_eq!(zapf_dingbats_encoding_lookup(0xB5), Some('\u{2469}')); // ⑩
+                                                                           // ❶ ❿  (a130–a139, octal 266–277) → U+2776–U+277F
+        assert_eq!(zapf_dingbats_encoding_lookup(0xB6), Some('\u{2776}')); // ❶
+        assert_eq!(zapf_dingbats_encoding_lookup(0xBF), Some('\u{277F}')); // ❿
+                                                                           // ➀ ➉  (a140–a149, octal 300–311) → U+2780–U+2789
+        assert_eq!(zapf_dingbats_encoding_lookup(0xC0), Some('\u{2780}')); // ➀
+        assert_eq!(zapf_dingbats_encoding_lookup(0xC9), Some('\u{2789}')); // ➉
+                                                                           // ➊ ➓  (a150–a159, octal 312–323) → U+278A–U+2793
+        assert_eq!(zapf_dingbats_encoding_lookup(0xCA), Some('\u{278A}')); // ➊
+        assert_eq!(zapf_dingbats_encoding_lookup(0xD3), Some('\u{2793}')); // ➓
+    }
+
+    /// ZapfDingbats arrow ranges (Annex D.6, octal 324–376).
+    #[test]
+    fn test_zapf_dingbats_arrows() {
+        assert_eq!(zapf_dingbats_encoding_lookup(0xD4), Some('\u{2794}')); // ➔
+        assert_eq!(zapf_dingbats_encoding_lookup(0xD5), Some('\u{2192}')); // →
+        assert_eq!(zapf_dingbats_encoding_lookup(0xD8), Some('\u{2798}')); // ➘
+        assert_eq!(zapf_dingbats_encoding_lookup(0xEF), Some('\u{27AF}')); // ➯
+        assert_eq!(zapf_dingbats_encoding_lookup(0xF0), None); // undefined in D.6
+        assert_eq!(zapf_dingbats_encoding_lookup(0xF1), Some('\u{27B1}')); // ➱
+        assert_eq!(zapf_dingbats_encoding_lookup(0xFE), Some('\u{27BE}')); // ➾
     }
 
     #[test]
@@ -8560,6 +8746,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -8604,6 +8793,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -8644,6 +8836,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -8682,6 +8877,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -8726,6 +8924,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         };
@@ -8867,6 +9068,9 @@ mod tests {
             cff_gid_map: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
+            type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             byte_to_width_table: std::sync::OnceLock::new(),
             diff_glyph_names: std::collections::HashMap::new(),
         }

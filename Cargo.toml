@@ -58,7 +58,7 @@ manual_checked_ops = "allow"
 
 [package]
 name = "pdf_oxide"
-version = "0.3.59"
+version = "0.3.60"
 # MSRV — driven up from 1.82 for v0.3.38. Transitive deps pulled in
 # this release push the floor to 1.88:
 #   - hybrid-array 0.4.10 (via RustCrypto) → edition 2024 → 1.85
@@ -301,6 +301,7 @@ tempfile = "3.27"
 crc32fast = "1.3"
 wasm-bindgen-test = "0.3"
 hex-literal = "1.1.0"
+jpeg-encoder = "0.7.0"
 
 # `criterion` pulls `rayon`, which cannot target wasm32. Benches only
 # ever run natively, so keep criterion out of the wasm32 dev-dep graph
