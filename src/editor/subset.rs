@@ -49,19 +49,14 @@ use crate::writer::ObjectSerializer;
 const MAX_DEPTH: usize = 256;
 
 /// What to do when a kept page carries a digital signature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignaturePolicy {
     /// Keep the signature's visual appearance (e.g. the seal image) as a plain
     /// annotation, drop the now-invalid signature value + `/AcroForm`, and warn.
+    #[default]
     PreserveVisual,
     /// Refuse to subset a document whose kept pages contain a signature.
     Refuse,
-}
-
-impl Default for SignaturePolicy {
-    fn default() -> Self {
-        SignaturePolicy::PreserveVisual
-    }
 }
 
 /// Options controlling a subset / rebuild.
@@ -435,10 +430,11 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Re-point the widget at its new page.
-        annot.insert("P".to_string(), Object::Reference(ObjectRef::new(page_id, 0)));
-
-        let remapped = self.remap_dict(src, &annot);
+        // Remap source references first (e.g. /AP), THEN insert the new-id /P —
+        // inserting a new-id reference before remapping would make `remap` treat
+        // it as a *source* reference and re-import the wrong object.
+        let mut remapped = self.remap_dict(src, &annot);
+        remapped.insert("P".to_string(), Object::Reference(ObjectRef::new(page_id, 0)));
         let aid = self.alloc();
         self.objects.insert(aid, Object::Dictionary(remapped));
         Ok(Some(Object::Reference(ObjectRef::new(aid, 0))))
