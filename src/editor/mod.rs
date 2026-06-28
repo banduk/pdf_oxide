@@ -89,6 +89,7 @@ mod document_editor;
 pub mod dom;
 pub mod form_fields;
 pub mod resource_manager;
+pub mod subset;
 
 pub use document_editor::{
     DocumentEditor, DocumentInfo, EditableDocument, EncryptionAlgorithm, EncryptionConfig,
@@ -103,3 +104,6 @@ pub use form_fields::{
     FormFieldType, FormFieldValue, FormFieldWrapper, ParentFieldConfig, WidgetConfig,
 };
 pub use resource_manager::ResourceManager;
+pub use subset::{
+    subset_pdf_bytes, subset_to_bytes, PdfRebuilder, SignaturePolicy, SubsetOptions, SubsetReport,
+};
