@@ -113,24 +113,38 @@ fn build_base() -> Vec<u8> {
 
 fn seal_present(doc: &PdfDocument) -> bool {
     let page = doc.get_page(0).unwrap();
-    let Some(annots) =
-        page.as_dict().and_then(|d| d.get("Annots")).and_then(|a| resolve(doc, a))
+    let Some(annots) = page
+        .as_dict()
+        .and_then(|d| d.get("Annots"))
+        .and_then(|a| resolve(doc, a))
     else {
         return false;
     };
     for a in annots.as_array().cloned().unwrap_or_default() {
-        let Some(annot) = resolve(doc, &a) else { continue };
-        let Some(n) =
-            annot.as_dict().and_then(|d| d.get("AP")).and_then(|ap| resolve(doc, ap)).and_then(
-                |ap| ap.as_dict().and_then(|d| d.get("N")).and_then(|n| resolve(doc, n)),
-            )
+        let Some(annot) = resolve(doc, &a) else {
+            continue;
+        };
+        let Some(n) = annot
+            .as_dict()
+            .and_then(|d| d.get("AP"))
+            .and_then(|ap| resolve(doc, ap))
+            .and_then(|ap| {
+                ap.as_dict()
+                    .and_then(|d| d.get("N"))
+                    .and_then(|n| resolve(doc, n))
+            })
         else {
             continue;
         };
-        if let Some(xo) =
-            n.as_dict().and_then(|d| d.get("Resources")).and_then(|r| resolve(doc, r)).and_then(
-                |r| r.as_dict().and_then(|d| d.get("XObject")).and_then(|x| resolve(doc, x)),
-            )
+        if let Some(xo) = n
+            .as_dict()
+            .and_then(|d| d.get("Resources"))
+            .and_then(|r| resolve(doc, r))
+            .and_then(|r| {
+                r.as_dict()
+                    .and_then(|d| d.get("XObject"))
+                    .and_then(|x| resolve(doc, x))
+            })
         {
             if let Some(xd) = xo.as_dict() {
                 if xd.values().any(|v| {
@@ -162,7 +176,9 @@ fn subset_drops_a_cryptographically_valid_signature_but_keeps_the_seal() {
 
     let signed = sign_pdf_bytes(&build_base(), &creds, SignOptions::default()).expect("sign");
     assert!(
-        signed.windows(b"/ByteRange".len()).any(|w| w == b"/ByteRange"),
+        signed
+            .windows(b"/ByteRange".len())
+            .any(|w| w == b"/ByteRange"),
         "signed PDF carries a signature"
     );
 
@@ -170,7 +186,11 @@ fn subset_drops_a_cryptographically_valid_signature_but_keeps_the_seal() {
     let signed_doc = PdfDocument::from_bytes(signed.clone()).expect("parse signed");
     // Reach the signature dict through the visible field's /V.
     let widget = signed_doc.load_object(ObjectRef::new(8, 0)).unwrap();
-    let sig_ref = widget.as_dict().and_then(|d| d.get("V")).and_then(|v| v.as_reference()).unwrap();
+    let sig_ref = widget
+        .as_dict()
+        .and_then(|d| d.get("V"))
+        .and_then(|v| v.as_reference())
+        .unwrap();
     let sig = signed_doc.load_object(sig_ref).unwrap();
     let sig_d = sig.as_dict().unwrap();
     let br: Vec<i64> = sig_d
@@ -199,7 +219,9 @@ fn subset_drops_a_cryptographically_valid_signature_but_keeps_the_seal() {
     assert!(out.extract_text(0).unwrap().contains("Signed Page"));
     assert!(seal_present(&out), "the bound seal image is preserved");
     assert!(
-        !subset.windows(b"/ByteRange".len()).any(|w| w == b"/ByteRange"),
+        !subset
+            .windows(b"/ByteRange".len())
+            .any(|w| w == b"/ByteRange"),
         "no /ByteRange survives the rebuild"
     );
     assert_eq!(report.dropped_signatures, 1);

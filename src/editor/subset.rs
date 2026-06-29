@@ -265,14 +265,22 @@ impl<'a> Builder<'a> {
                 let new_id = self.import(src, *r, depth);
                 Object::Reference(ObjectRef::new(new_id, 0))
             },
-            Object::Array(items) => {
-                Object::Array(items.iter().map(|o| self.remap(src, o, depth + 1)).collect())
-            },
+            Object::Array(items) => Object::Array(
+                items
+                    .iter()
+                    .map(|o| self.remap(src, o, depth + 1))
+                    .collect(),
+            ),
             Object::Dictionary(d) => Object::Dictionary(
-                d.iter().map(|(k, v)| (k.clone(), self.remap(src, v, depth + 1))).collect(),
+                d.iter()
+                    .map(|(k, v)| (k.clone(), self.remap(src, v, depth + 1)))
+                    .collect(),
             ),
             Object::Stream { dict, data } => Object::Stream {
-                dict: dict.iter().map(|(k, v)| (k.clone(), self.remap(src, v, depth + 1))).collect(),
+                dict: dict
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.remap(src, v, depth + 1)))
+                    .collect(),
                 data: data.clone(),
             },
             other => other.clone(),
@@ -281,8 +289,14 @@ impl<'a> Builder<'a> {
 
     /// Remap an already-owned dictionary's values (used for synthesized dicts
     /// such as a trimmed `/Resources` or an edited annotation).
-    fn remap_dict(&mut self, src: usize, dict: &HashMap<String, Object>) -> HashMap<String, Object> {
-        dict.iter().map(|(k, v)| (k.clone(), self.remap(src, v, 1))).collect()
+    fn remap_dict(
+        &mut self,
+        src: usize,
+        dict: &HashMap<String, Object>,
+    ) -> HashMap<String, Object> {
+        dict.iter()
+            .map(|(k, v)| (k.clone(), self.remap(src, v, 1)))
+            .collect()
     }
 
     fn keep_set<'b>(used: &'b UsedNames, category: &str) -> Option<&'b HashSet<String>> {
@@ -324,7 +338,9 @@ impl<'a> Builder<'a> {
             _ => return Object::Dictionary(out),
         };
         for category in RESOURCE_CATEGORIES {
-            let Some(keep) = Self::keep_set(used, category) else { continue };
+            let Some(keep) = Self::keep_set(used, category) else {
+                continue;
+            };
             if keep.is_empty() {
                 continue;
             }
@@ -332,7 +348,9 @@ impl<'a> Builder<'a> {
             let Some(sub) = res_dict.get(category).and_then(|c| self.resolve(src, c)) else {
                 continue;
             };
-            let Some(sub_dict) = sub.as_dict().cloned() else { continue };
+            let Some(sub_dict) = sub.as_dict().cloned() else {
+                continue;
+            };
             let mut new_sub: HashMap<String, Object> = HashMap::new();
             for (name, value) in sub_dict.iter() {
                 if !keep.contains(name) {
@@ -373,7 +391,9 @@ impl<'a> Builder<'a> {
         let new_id = self.alloc();
         self.form_trim_map.insert((src, form_ref.id), new_id);
 
-        let form_obj = self.sources[src].load_object(form_ref).unwrap_or(Object::Null);
+        let form_obj = self.sources[src]
+            .load_object(form_ref)
+            .unwrap_or(Object::Null);
         let (dict, data) = match &form_obj {
             Object::Stream { dict, data } => (dict.clone(), data.clone()),
             // Not a stream (shouldn't happen for /Subtype /Form) — copy wholesale.
@@ -399,7 +419,8 @@ impl<'a> Builder<'a> {
             let trimmed = self.build_trimmed_resources(src, &fr, &used, depth + 1);
             nd.insert("Resources".to_string(), trimmed);
         }
-        self.objects.insert(new_id, Object::Stream { dict: nd, data });
+        self.objects
+            .insert(new_id, Object::Stream { dict: nd, data });
         new_id
     }
 
@@ -452,7 +473,10 @@ impl<'a> Builder<'a> {
         }
 
         // Trimmed resources (already imported as new-id refs; insert directly).
-        if let Some(res) = page_dict.get("Resources").and_then(|r| self.resolve(src, r)) {
+        if let Some(res) = page_dict
+            .get("Resources")
+            .and_then(|r| self.resolve(src, r))
+        {
             let trimmed = self.build_trimmed_resources(src, &res, &used, 0);
             new_page.insert("Resources".to_string(), trimmed);
         }
@@ -564,12 +588,20 @@ impl<'a> Builder<'a> {
 
     /// Import the source's `/Info` dictionary (document metadata) if present.
     fn import_info(&mut self, src: usize) -> Option<u32> {
-        let info_ref = self.sources[src].trailer().as_dict()?.get("Info")?.as_reference()?;
+        let info_ref = self.sources[src]
+            .trailer()
+            .as_dict()?
+            .get("Info")?
+            .as_reference()?;
         Some(self.import(src, info_ref, 0))
     }
 
     fn source_catalog(&self, src: usize) -> Option<HashMap<String, Object>> {
-        let root = self.sources[src].trailer().as_dict()?.get("Root")?.as_reference()?;
+        let root = self.sources[src]
+            .trailer()
+            .as_dict()?
+            .get("Root")?
+            .as_reference()?;
         self.sources[src].load_object(root).ok()?.as_dict().cloned()
     }
 
@@ -612,17 +644,28 @@ impl<'a> Builder<'a> {
     fn resolve_named_dest_string(&self, src: usize, key: &[u8]) -> Option<Object> {
         let cat = self.source_catalog(src)?;
         let names = cat.get("Names").and_then(|n| self.resolve(src, n))?;
-        let dests = names.as_dict()?.get("Dests").and_then(|d| self.resolve(src, d))?;
+        let dests = names
+            .as_dict()?
+            .get("Dests")
+            .and_then(|d| self.resolve(src, d))?;
         self.name_tree_lookup(src, &dests, key, 0)
     }
 
-    fn name_tree_lookup(&self, src: usize, node: &Object, key: &[u8], depth: usize) -> Option<Object> {
+    fn name_tree_lookup(
+        &self,
+        src: usize,
+        node: &Object,
+        key: &[u8],
+        depth: usize,
+    ) -> Option<Object> {
         if depth > 32 {
             return None;
         }
         let nd = node.as_dict()?;
-        if let Some(names) =
-            nd.get("Names").and_then(|n| self.resolve(src, n)).and_then(|o| o.as_array().cloned())
+        if let Some(names) = nd
+            .get("Names")
+            .and_then(|n| self.resolve(src, n))
+            .and_then(|o| o.as_array().cloned())
         {
             let mut i = 0;
             while i + 1 < names.len() {
@@ -632,11 +675,15 @@ impl<'a> Builder<'a> {
                 i += 2;
             }
         }
-        if let Some(kids) =
-            nd.get("Kids").and_then(|k| self.resolve(src, k)).and_then(|o| o.as_array().cloned())
+        if let Some(kids) = nd
+            .get("Kids")
+            .and_then(|k| self.resolve(src, k))
+            .and_then(|o| o.as_array().cloned())
         {
             for kid in kids {
-                let Some(kid_obj) = self.resolve(src, &kid) else { continue };
+                let Some(kid_obj) = self.resolve(src, &kid) else {
+                    continue;
+                };
                 if let Some(v) = self.name_tree_lookup(src, &kid_obj, key, depth + 1) {
                     return Some(v);
                 }
@@ -681,7 +728,11 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn outline_dest(&self, src: usize, item: &HashMap<String, Object>) -> Option<(&'static str, Object)> {
+    fn outline_dest(
+        &self,
+        src: usize,
+        item: &HashMap<String, Object>,
+    ) -> Option<(&'static str, Object)> {
         if let Some(d) = item.get("Dest") {
             return self.remap_dest_value(src, d).map(|v| ("Dest", v));
         }
@@ -706,8 +757,10 @@ impl<'a> Builder<'a> {
             return result;
         }
         while let Some(item_ref) = cur {
-            let Some(item) =
-                self.sources[src].load_object(item_ref).ok().and_then(|o| o.as_dict().cloned())
+            let Some(item) = self.sources[src]
+                .load_object(item_ref)
+                .ok()
+                .and_then(|o| o.as_dict().cloned())
             else {
                 break;
             };
@@ -751,10 +804,16 @@ impl<'a> Builder<'a> {
             let id = result[i];
             if let Some(Object::Dictionary(d)) = self.objects.get_mut(&id) {
                 if i > 0 {
-                    d.insert("Prev".to_string(), Object::Reference(ObjectRef::new(result[i - 1], 0)));
+                    d.insert(
+                        "Prev".to_string(),
+                        Object::Reference(ObjectRef::new(result[i - 1], 0)),
+                    );
                 }
                 if i + 1 < result.len() {
-                    d.insert("Next".to_string(), Object::Reference(ObjectRef::new(result[i + 1], 0)));
+                    d.insert(
+                        "Next".to_string(),
+                        Object::Reference(ObjectRef::new(result[i + 1], 0)),
+                    );
                 }
             }
         }
@@ -767,7 +826,10 @@ impl<'a> Builder<'a> {
         let cat = self.source_catalog(src)?;
         let outlines_ref = cat.get("Outlines")?.as_reference()?;
         let outlines = self.sources[src].load_object(outlines_ref).ok()?;
-        let first = outlines.as_dict()?.get("First").and_then(|f| f.as_reference());
+        let first = outlines
+            .as_dict()?
+            .get("First")
+            .and_then(|f| f.as_reference());
 
         let outlines_id = self.alloc();
         self.pinned.insert(outlines_id);
@@ -778,7 +840,10 @@ impl<'a> Builder<'a> {
         }
         let mut d: HashMap<String, Object> = HashMap::new();
         d.insert("Type".to_string(), Object::Name("Outlines".to_string()));
-        d.insert("First".to_string(), Object::Reference(ObjectRef::new(*kids.first().unwrap(), 0)));
+        d.insert(
+            "First".to_string(),
+            Object::Reference(ObjectRef::new(*kids.first().unwrap(), 0)),
+        );
         d.insert("Last".to_string(), Object::Reference(ObjectRef::new(*kids.last().unwrap(), 0)));
         d.insert("Count".to_string(), Object::Integer(kids.len() as i64));
         self.objects.insert(outlines_id, Object::Dictionary(d));
@@ -898,7 +963,11 @@ impl<'a> Builder<'a> {
     fn build_struct_tree(&mut self, src: usize) -> Option<u32> {
         let cat = self.source_catalog(src)?;
         let st_ref = cat.get("StructTreeRoot")?.as_reference()?;
-        let st_dict = self.sources[src].load_object(st_ref).ok()?.as_dict()?.clone();
+        let st_dict = self.sources[src]
+            .load_object(st_ref)
+            .ok()?
+            .as_dict()?
+            .clone();
 
         let root_id = self.alloc();
         self.pinned.insert(root_id);
@@ -926,7 +995,9 @@ impl<'a> Builder<'a> {
         let mut nums: Vec<Object> = Vec::new();
         let mut next_key: i64 = 0;
         for pg in self.page_ids.clone() {
-            let Some(entries) = by_page.get(&pg) else { continue };
+            let Some(entries) = by_page.get(&pg) else {
+                continue;
+            };
             let key = next_key;
             next_key += 1;
             if let Some(Object::Dictionary(d)) = self.objects.get_mut(&pg) {
@@ -959,7 +1030,10 @@ impl<'a> Builder<'a> {
                 Object::Reference(ObjectRef::new(root_kids[0], 0))
             } else {
                 Object::Array(
-                    root_kids.iter().map(|&id| Object::Reference(ObjectRef::new(id, 0))).collect(),
+                    root_kids
+                        .iter()
+                        .map(|&id| Object::Reference(ObjectRef::new(id, 0)))
+                        .collect(),
                 )
             },
         );
@@ -1043,8 +1117,16 @@ impl<'a> Builder<'a> {
         let info_id = self.import_info(0);
         // Document-level semantic structures come from source 0 (the subset
         // case); a multi-source rebuild does not merge outlines/tags.
-        let outlines_id = if self.opts.keep_outlines { self.build_outlines(0) } else { None };
-        let struct_id = if self.opts.keep_struct_tree { self.build_struct_tree(0) } else { None };
+        let outlines_id = if self.opts.keep_outlines {
+            self.build_outlines(0)
+        } else {
+            None
+        };
+        let struct_id = if self.opts.keep_struct_tree {
+            self.build_struct_tree(0)
+        } else {
+            None
+        };
 
         if self.opts.dedup {
             self.dedup();
@@ -1063,13 +1145,16 @@ impl<'a> Builder<'a> {
             }
         }
 
-        let kids: Vec<Object> =
-            page_ids.iter().map(|&pid| Object::Reference(ObjectRef::new(pid, 0))).collect();
+        let kids: Vec<Object> = page_ids
+            .iter()
+            .map(|&pid| Object::Reference(ObjectRef::new(pid, 0)))
+            .collect();
         let mut pages_dict: HashMap<String, Object> = HashMap::new();
         pages_dict.insert("Type".to_string(), Object::Name("Pages".to_string()));
         pages_dict.insert("Count".to_string(), Object::Integer(page_ids.len() as i64));
         pages_dict.insert("Kids".to_string(), Object::Array(kids));
-        self.objects.insert(pages_id, Object::Dictionary(pages_dict));
+        self.objects
+            .insert(pages_id, Object::Dictionary(pages_dict));
 
         let mut catalog: HashMap<String, Object> = HashMap::new();
         catalog.insert("Type".to_string(), Object::Name("Catalog".to_string()));
@@ -1173,11 +1258,15 @@ fn rewrite_refs(obj: &mut Object, map: &HashMap<u32, u32>) -> bool {
             },
             None => false,
         },
-        Object::Array(a) => a.iter_mut().fold(false, |acc, o| rewrite_refs(o, map) | acc),
-        Object::Dictionary(d) => d.values_mut().fold(false, |acc, o| rewrite_refs(o, map) | acc),
-        Object::Stream { dict, .. } => {
-            dict.values_mut().fold(false, |acc, o| rewrite_refs(o, map) | acc)
-        },
+        Object::Array(a) => a
+            .iter_mut()
+            .fold(false, |acc, o| rewrite_refs(o, map) | acc),
+        Object::Dictionary(d) => d
+            .values_mut()
+            .fold(false, |acc, o| rewrite_refs(o, map) | acc),
+        Object::Stream { dict, .. } => dict
+            .values_mut()
+            .fold(false, |acc, o| rewrite_refs(o, map) | acc),
         _ => false,
     }
 }
@@ -1307,7 +1396,11 @@ fn all_page_leaf_ids(doc: &PdfDocument) -> Vec<u32> {
         .and_then(|d| d.get("Root"))
         .and_then(|r| r.as_reference())
         .and_then(|root| doc.load_object(root).ok())
-        .and_then(|cat| cat.as_dict().and_then(|d| d.get("Pages")).and_then(|p| p.as_reference()))
+        .and_then(|cat| {
+            cat.as_dict()
+                .and_then(|d| d.get("Pages"))
+                .and_then(|p| p.as_reference())
+        })
     {
         collect_leaf_ids(doc, pages_ref, &mut leaves, &mut visited, 0);
     }
@@ -1330,7 +1423,11 @@ fn collect_leaf_ids(
     let Some(dict) = node.as_dict() else {
         return;
     };
-    let is_pages = dict.get("Type").and_then(|t| t.as_name()).map(|n| n == "Pages").unwrap_or(false);
+    let is_pages = dict
+        .get("Type")
+        .and_then(|t| t.as_name())
+        .map(|n| n == "Pages")
+        .unwrap_or(false);
     if is_pages {
         if let Some(kids) = dict.get("Kids").and_then(|k| k.as_array()) {
             for kid in kids {

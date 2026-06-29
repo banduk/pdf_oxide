@@ -70,18 +70,14 @@ fn build_doc() -> Vec<u8> {
         );
         objects.push((pid, page.into_bytes()));
 
-        let mut cbody =
-            format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        let mut cbody = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
         cbody.extend_from_slice(content.as_bytes());
         cbody.extend_from_slice(b"\nendstream");
         objects.push((cid, cbody));
     }
 
     objects.push((1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()));
-    objects.push((
-        2,
-        format!("<< /Type /Pages /Kids [{kids}] /Count {PAGES} >>").into_bytes(),
-    ));
+    objects.push((2, format!("<< /Type /Pages /Kids [{kids}] /Count {PAGES} >>").into_bytes()));
 
     // Serialize with an xref (object ids are sparse-but-bounded).
     let max_id = objects.iter().map(|(id, _)| *id).max().unwrap() as usize;
@@ -133,7 +129,10 @@ fn bench_subset(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("half_pages", "dedup_off"), |b| {
         b.iter(|| {
-            let opts = SubsetOptions { dedup: false, ..SubsetOptions::default() };
+            let opts = SubsetOptions {
+                dedup: false,
+                ..SubsetOptions::default()
+            };
             let (out, _) = subset_to_bytes(black_box(&[&doc]), black_box(&keep), opts).unwrap();
             black_box(out);
         });

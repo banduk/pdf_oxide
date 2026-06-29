@@ -79,8 +79,12 @@ fn build_doc() -> Vec<u8> {
         }
     }
     out.extend_from_slice(
-        format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", max_id + 1, xref_start)
-            .as_bytes(),
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            max_id + 1,
+            xref_start
+        )
+        .as_bytes(),
     );
     out
 }

@@ -33,8 +33,10 @@ fn build_bloated_fixture() -> Vec<u8> {
         v
     }
 
-    let content1 = b"BT /FUsed 12 Tf 20 100 Td (Page1) Tj ET\nq 50 0 0 50 20 20 cm /ImA Do Q".to_vec();
-    let content2 = b"BT /FUsed 12 Tf 20 100 Td (Page2) Tj ET\nq 50 0 0 50 20 20 cm /ImB Do Q".to_vec();
+    let content1 =
+        b"BT /FUsed 12 Tf 20 100 Td (Page1) Tj ET\nq 50 0 0 50 20 20 cm /ImA Do Q".to_vec();
+    let content2 =
+        b"BT /FUsed 12 Tf 20 100 Td (Page2) Tj ET\nq 50 0 0 50 20 20 cm /ImB Do Q".to_vec();
     let content3 = b"BT /FUsed 12 Tf 20 100 Td (Page3) Tj ET".to_vec();
 
     // A 1x1 gray pixel — ImA and ImB share these exact bytes.
@@ -101,7 +103,10 @@ fn build_bloated_fixture() -> Vec<u8> {
 }
 
 /// Resolve a value that may be an indirect reference.
-fn resolve(doc: &PdfDocument, obj: &pdf_oxide::object::Object) -> Option<pdf_oxide::object::Object> {
+fn resolve(
+    doc: &PdfDocument,
+    obj: &pdf_oxide::object::Object,
+) -> Option<pdf_oxide::object::Object> {
     match obj {
         pdf_oxide::object::Object::Reference(r) => doc.load_object(*r).ok(),
         other => Some(other.clone()),
@@ -121,7 +126,9 @@ fn analyze(bytes: &[u8], pages: &[usize]) -> (HashSet<u32>, BTreeSet<String>) {
         let Some(res) = page_dict.get("Resources").and_then(|r| resolve(&doc, r)) else {
             continue;
         };
-        let Some(res_dict) = res.as_dict() else { continue };
+        let Some(res_dict) = res.as_dict() else {
+            continue;
+        };
 
         if let Some(xo) = res_dict.get("XObject").and_then(|x| resolve(&doc, x)) {
             if let Some(xo_dict) = xo.as_dict() {
@@ -146,8 +153,10 @@ fn analyze(bytes: &[u8], pages: &[usize]) -> (HashSet<u32>, BTreeSet<String>) {
             if let Some(fo_dict) = fo.as_dict() {
                 for v in fo_dict.values() {
                     if let Some(obj) = resolve(&doc, v) {
-                        if let Some(name) =
-                            obj.as_dict().and_then(|d| d.get("BaseFont")).and_then(|b| b.as_name())
+                        if let Some(name) = obj
+                            .as_dict()
+                            .and_then(|d| d.get("BaseFont"))
+                            .and_then(|b| b.as_name())
                         {
                             basefonts.insert(name.to_string());
                         }
@@ -196,7 +205,9 @@ fn subset_preserves_text_drops_garbage_and_dedups() {
 
     // --- Contrast: the existing extract path keeps the inherited garbage ---
     let mut editor2 = DocumentEditor::from_bytes(fixture).expect("open editor 2");
-    let naive = editor2.extract_pages_to_bytes(&[0, 1]).expect("extract_pages_to_bytes");
+    let naive = editor2
+        .extract_pages_to_bytes(&[0, 1])
+        .expect("extract_pages_to_bytes");
     let (naive_images, naive_fonts) = analyze(&naive, &[0, 1]);
     assert!(
         naive_images.len() > images.len() || naive_fonts.len() > fonts.len(),
@@ -326,26 +337,46 @@ fn build_signed_fixture() -> Vec<u8> {
 fn seal_image_count(doc: &PdfDocument) -> usize {
     let mut count = 0;
     let page = doc.get_page(0).expect("get_page 0");
-    let Some(annots) = page.as_dict().and_then(|d| d.get("Annots")).and_then(|a| resolve(doc, a))
+    let Some(annots) = page
+        .as_dict()
+        .and_then(|d| d.get("Annots"))
+        .and_then(|a| resolve(doc, a))
     else {
         return 0;
     };
-    let Some(arr) = annots.as_array() else { return 0 };
+    let Some(arr) = annots.as_array() else {
+        return 0;
+    };
     for a in arr {
-        let Some(annot) = resolve(doc, a) else { continue };
-        let Some(ap) = annot.as_dict().and_then(|d| d.get("AP")).and_then(|x| resolve(doc, x))
+        let Some(annot) = resolve(doc, a) else {
+            continue;
+        };
+        let Some(ap) = annot
+            .as_dict()
+            .and_then(|d| d.get("AP"))
+            .and_then(|x| resolve(doc, x))
         else {
             continue;
         };
-        let Some(n) = ap.as_dict().and_then(|d| d.get("N")).and_then(|x| resolve(doc, x)) else {
+        let Some(n) = ap
+            .as_dict()
+            .and_then(|d| d.get("N"))
+            .and_then(|x| resolve(doc, x))
+        else {
             continue;
         };
         // Walk the appearance form's resources for image XObjects.
-        let Some(res) = n.as_dict().and_then(|d| d.get("Resources")).and_then(|r| resolve(doc, r))
+        let Some(res) = n
+            .as_dict()
+            .and_then(|d| d.get("Resources"))
+            .and_then(|r| resolve(doc, r))
         else {
             continue;
         };
-        if let Some(xo) = res.as_dict().and_then(|d| d.get("XObject")).and_then(|x| resolve(doc, x))
+        if let Some(xo) = res
+            .as_dict()
+            .and_then(|d| d.get("XObject"))
+            .and_then(|x| resolve(doc, x))
         {
             if let Some(xo_dict) = xo.as_dict() {
                 for v in xo_dict.values() {
@@ -372,7 +403,9 @@ fn subset_preserves_signature_seal_but_drops_invalid_signature() {
 
     // Sanity: the fixture itself contains a /ByteRange signature dict.
     assert!(
-        fixture.windows(b"/ByteRange".len()).any(|w| w == b"/ByteRange"),
+        fixture
+            .windows(b"/ByteRange".len())
+            .any(|w| w == b"/ByteRange"),
         "fixture should contain a signature"
     );
 
@@ -390,7 +423,9 @@ fn subset_preserves_signature_seal_but_drops_invalid_signature() {
 
     // Nothing claims to be a valid signature any more.
     assert!(
-        !subset.windows(b"/ByteRange".len()).any(|w| w == b"/ByteRange"),
+        !subset
+            .windows(b"/ByteRange".len())
+            .any(|w| w == b"/ByteRange"),
         "no /ByteRange signature dict survives a rebuild"
     );
     assert!(
@@ -413,8 +448,7 @@ fn subset_refuses_signed_page_when_policy_is_refuse() {
     assert!(result.is_err(), "Refuse policy must reject subsetting a signed page");
 
     // The unsigned page (1) is fine under Refuse.
-    let mut editor2 =
-        DocumentEditor::from_bytes(build_signed_fixture()).expect("open editor 2");
+    let mut editor2 = DocumentEditor::from_bytes(build_signed_fixture()).expect("open editor 2");
     let opts2 = SubsetOptions {
         on_signature: SignaturePolicy::Refuse,
         ..SubsetOptions::default()
@@ -437,7 +471,8 @@ fn build_outline_fixture() -> Vec<u8> {
         v.extend_from_slice(b"\nendstream");
         v
     }
-    let objects: Vec<(u32, Vec<u8>)> = vec![
+    let objects: Vec<(u32, Vec<u8>)> =
+        vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R /Outlines 30 0 R >>".to_vec()),
         (
             2,
@@ -506,15 +541,24 @@ fn build_outline_fixture() -> Vec<u8> {
 /// Outline titles in /First.. /Next order, and the /Type of each /Dest target.
 fn outline_titles_and_targets(doc: &PdfDocument) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let Ok(catalog) = doc.catalog() else { return out };
-    let Some(outlines) =
-        catalog.as_dict().and_then(|d| d.get("Outlines")).and_then(|o| resolve(doc, o))
+    let Ok(catalog) = doc.catalog() else {
+        return out;
+    };
+    let Some(outlines) = catalog
+        .as_dict()
+        .and_then(|d| d.get("Outlines"))
+        .and_then(|o| resolve(doc, o))
     else {
         return out;
     };
-    let mut cur = outlines.as_dict().and_then(|d| d.get("First")).and_then(|f| f.as_reference());
+    let mut cur = outlines
+        .as_dict()
+        .and_then(|d| d.get("First"))
+        .and_then(|f| f.as_reference());
     while let Some(item_ref) = cur {
-        let Ok(item) = doc.load_object(item_ref) else { break };
+        let Ok(item) = doc.load_object(item_ref) else {
+            break;
+        };
         let Some(d) = item.as_dict() else { break };
         let title = d
             .get("Title")
@@ -527,7 +571,12 @@ fn outline_titles_and_targets(doc: &PdfDocument) -> Vec<(String, String)> {
             .and_then(|a| a.first())
             .and_then(|f| f.as_reference())
             .and_then(|r| doc.load_object(r).ok())
-            .and_then(|o| o.as_dict().and_then(|dd| dd.get("Type")).and_then(|t| t.as_name()).map(String::from))
+            .and_then(|o| {
+                o.as_dict()
+                    .and_then(|dd| dd.get("Type"))
+                    .and_then(|t| t.as_name())
+                    .map(String::from)
+            })
             .unwrap_or_default();
         out.push((title, target));
         cur = d.get("Next").and_then(|n| n.as_reference());
@@ -567,7 +616,12 @@ fn subset_remaps_links_and_prunes_outlines() {
         .and_then(|a| resolve(&out, a))
         .and_then(|a| a.as_array().and_then(|arr| arr.first().cloned()))
         .and_then(|e| resolve(&out, &e))
-        .map(|annot| annot.as_dict().map(|d| d.contains_key("Dest")).unwrap_or(false))
+        .map(|annot| {
+            annot
+                .as_dict()
+                .map(|d| d.contains_key("Dest"))
+                .unwrap_or(false)
+        })
         .unwrap_or(false);
     assert!(p0_link_has_dest, "page 0's link to a kept page keeps its /Dest");
 
@@ -578,7 +632,12 @@ fn subset_remaps_links_and_prunes_outlines() {
         .and_then(|a| resolve(&out, a))
         .and_then(|a| a.as_array().and_then(|arr| arr.first().cloned()))
         .and_then(|e| resolve(&out, &e))
-        .map(|annot| annot.as_dict().map(|d| d.contains_key("Dest")).unwrap_or(false))
+        .map(|annot| {
+            annot
+                .as_dict()
+                .map(|d| d.contains_key("Dest"))
+                .unwrap_or(false)
+        })
         .unwrap_or(false);
     assert!(!p1_link_has_dest, "page 1's link to a dropped page is severed");
     assert!(report.links_severed >= 1, "at least one link was severed");
@@ -652,19 +711,41 @@ fn build_form_fixture() -> Vec<u8> {
 /// Count image XObjects inside the page's form `/Fm`'s own /Resources.
 fn form_internal_image_count(doc: &PdfDocument) -> usize {
     let page = doc.get_page(0).expect("page");
-    let res = page.as_dict().and_then(|d| d.get("Resources")).and_then(|r| resolve(doc, r)).unwrap();
-    let xo = res.as_dict().and_then(|d| d.get("XObject")).and_then(|x| resolve(doc, x)).unwrap();
-    let fm = xo.as_dict().and_then(|d| d.get("Fm")).and_then(|f| resolve(doc, f)).unwrap();
-    let fres = fm.as_dict().and_then(|d| d.get("Resources")).and_then(|r| resolve(doc, r)).unwrap();
-    let fxo = fres.as_dict().and_then(|d| d.get("XObject")).and_then(|x| resolve(doc, x));
+    let res = page
+        .as_dict()
+        .and_then(|d| d.get("Resources"))
+        .and_then(|r| resolve(doc, r))
+        .unwrap();
+    let xo = res
+        .as_dict()
+        .and_then(|d| d.get("XObject"))
+        .and_then(|x| resolve(doc, x))
+        .unwrap();
+    let fm = xo
+        .as_dict()
+        .and_then(|d| d.get("Fm"))
+        .and_then(|f| resolve(doc, f))
+        .unwrap();
+    let fres = fm
+        .as_dict()
+        .and_then(|d| d.get("Resources"))
+        .and_then(|r| resolve(doc, r))
+        .unwrap();
+    let fxo = fres
+        .as_dict()
+        .and_then(|d| d.get("XObject"))
+        .and_then(|x| resolve(doc, x));
     let Some(fxo) = fxo else { return 0 };
     fxo.as_dict()
         .map(|d| {
             d.values()
                 .filter(|v| {
-                    resolve(doc, v)
-                        .and_then(|o| o.as_dict().and_then(|dd| dd.get("Subtype")).and_then(|s| s.as_name()).map(String::from))
-                        == Some("Image".to_string())
+                    resolve(doc, v).and_then(|o| {
+                        o.as_dict()
+                            .and_then(|dd| dd.get("Subtype"))
+                            .and_then(|s| s.as_name())
+                            .map(String::from)
+                    }) == Some("Image".to_string())
                 })
                 .count()
         })
@@ -683,7 +764,10 @@ fn subset_trims_form_internal_resources() {
     assert_eq!(form_internal_image_count(&out), 1, "form keeps only its used image");
 
     // trim_forms OFF: the form is copied wholesale, unused image retained.
-    let opts = SubsetOptions { trim_forms: false, ..SubsetOptions::default() };
+    let opts = SubsetOptions {
+        trim_forms: false,
+        ..SubsetOptions::default()
+    };
     let (whole, _) = pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], opts).unwrap();
     let out2 = PdfDocument::from_bytes(whole).expect("parse whole");
     assert_eq!(form_internal_image_count(&out2), 2, "wholesale form keeps both images");
@@ -772,17 +856,26 @@ fn subset_prunes_structure_tree_to_kept_pages() {
     let out = PdfDocument::from_bytes(subset).expect("subset parses");
 
     // Document + one surviving /P.
-    assert_eq!(report.struct_elements, 2, "Document + the kept page's P survive (P for page 1 pruned)");
+    assert_eq!(
+        report.struct_elements, 2,
+        "Document + the kept page's P survive (P for page 1 pruned)"
+    );
 
     let cat = out.catalog().unwrap();
     let cat_d = cat.as_dict().unwrap();
     assert!(cat_d.contains_key("MarkInfo"), "MarkInfo present");
-    let st = cat_d.get("StructTreeRoot").and_then(|s| resolve(&out, s)).expect("StructTreeRoot");
+    let st = cat_d
+        .get("StructTreeRoot")
+        .and_then(|s| resolve(&out, s))
+        .expect("StructTreeRoot");
     let st_d = st.as_dict().unwrap();
     assert_eq!(st_d.get("Type").and_then(|t| t.as_name()), Some("StructTreeRoot"));
 
     // Root /K -> Document element.
-    let docel = st_d.get("K").and_then(|k| resolve(&out, k)).expect("doc elem");
+    let docel = st_d
+        .get("K")
+        .and_then(|k| resolve(&out, k))
+        .expect("doc elem");
     let docel_d = docel.as_dict().unwrap();
     assert_eq!(docel_d.get("S").and_then(|s| s.as_name()), Some("Document"));
 
@@ -797,15 +890,37 @@ fn subset_prunes_structure_tree_to_kept_pages() {
     let p_d = p.as_dict().unwrap();
     assert_eq!(p_d.get("S").and_then(|s| s.as_name()), Some("P"));
     let pg = p_d.get("Pg").and_then(|g| resolve(&out, g)).unwrap();
-    assert_eq!(pg.as_dict().and_then(|d| d.get("Type")).and_then(|t| t.as_name()), Some("Page"));
+    assert_eq!(
+        pg.as_dict()
+            .and_then(|d| d.get("Type"))
+            .and_then(|t| t.as_name()),
+        Some("Page")
+    );
 
     // ParentTree maps the kept page's StructParents key to the P element.
-    let pt = st_d.get("ParentTree").and_then(|p| resolve(&out, p)).expect("ParentTree");
-    let nums = pt.as_dict().and_then(|d| d.get("Nums")).and_then(|n| n.as_array()).expect("Nums");
+    let pt = st_d
+        .get("ParentTree")
+        .and_then(|p| resolve(&out, p))
+        .expect("ParentTree");
+    let nums = pt
+        .as_dict()
+        .and_then(|d| d.get("Nums"))
+        .and_then(|n| n.as_array())
+        .expect("Nums");
     assert!(nums.len() >= 2, "at least one (key, array) pair");
     let arr = resolve(&out, &nums[1]).unwrap();
-    let first = arr.as_array().and_then(|a| a.first()).and_then(|e| resolve(&out, e)).unwrap();
-    assert_eq!(first.as_dict().and_then(|d| d.get("S")).and_then(|s| s.as_name()), Some("P"));
+    let first = arr
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|e| resolve(&out, e))
+        .unwrap();
+    assert_eq!(
+        first
+            .as_dict()
+            .and_then(|d| d.get("S"))
+            .and_then(|s| s.as_name()),
+        Some("P")
+    );
 
     // Text still extracts.
     assert!(out.extract_text(0).unwrap().contains("Page0"));
