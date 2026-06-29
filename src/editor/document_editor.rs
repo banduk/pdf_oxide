@@ -769,10 +769,15 @@ impl DocumentEditor {
         pages: &[usize],
         opts: crate::editor::subset::SubsetOptions,
     ) -> Result<(Vec<u8>, crate::editor::subset::SubsetReport)> {
-        // Capture the current state (including staged edits) before subsetting.
+        let picks: Vec<(usize, usize)> = pages.iter().map(|&p| (0usize, p)).collect();
+        // Fast path: with no staged edits, subset the source directly and skip a
+        // full save + reparse of the whole document.
+        if !self.is_modified {
+            return crate::editor::subset::subset_to_bytes(&[&self.source], &picks, opts);
+        }
+        // Otherwise capture the edited state first.
         let bytes = self.save_to_bytes()?;
         let doc = PdfDocument::from_bytes(bytes)?;
-        let picks: Vec<(usize, usize)> = pages.iter().map(|&p| (0usize, p)).collect();
         crate::editor::subset::subset_to_bytes(&[&doc], &picks, opts)
     }
 
