@@ -13,7 +13,7 @@ Design principles:
 
 import pytest
 
-from pdf_oxide import Pdf, PdfDocument
+from pdf_oxide import Pdf, PdfDocument, PdfRebuilder
 
 
 _PDF_MAGIC = b"%PDF-"
@@ -1086,3 +1086,29 @@ class TestSubsetPages:
             doc.subset_pages([0], resources="bogus")
         with pytest.raises(ValueError):
             doc.subset_pages([0], on_signature="bogus")
+
+
+class TestPdfRebuilder:
+    def test_rebuild_merges_pages_from_two_sources(self):
+        a = Pdf.from_markdown("# Document A").to_bytes()
+        b = Pdf.from_markdown("# Document B").to_bytes()
+        rb = PdfRebuilder()
+        ia = rb.add_source(a)
+        ib = rb.add_source(b)
+        rb.add_page(ia, 0)
+        rb.add_page(ib, 0)
+        out = rb.build()
+        assert out[:5] == _PDF_MAGIC
+        assert PdfDocument.from_bytes(out).page_count() == 2
+
+    def test_rebuild_add_pages_and_options(self):
+        a = Pdf.from_markdown("# Only").to_bytes()
+        rb = PdfRebuilder(resources="wholesale", dedup=False, keep_struct_tree=False)
+        i = rb.add_source(a)
+        rb.add_pages(i, [0])
+        out = rb.build()
+        assert PdfDocument.from_bytes(out).page_count() == 1
+
+    def test_rebuild_bad_option_raises(self):
+        with pytest.raises(ValueError):
+            PdfRebuilder(resources="bogus")

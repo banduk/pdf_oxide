@@ -257,6 +257,8 @@ from .pdf_oxide import (  # noqa: E402
     # PDF Creation
     Pdf,
     PdfDocument,
+    # Multi-source page rebuild / merge
+    PdfRebuilder,
     RadialGradient,
     RevocationMaterial,
     Signature,
@@ -303,6 +305,8 @@ __all__ = [
     "StreamingTable",
     # PDF Creation
     "Pdf",
+    # Multi-source page rebuild / merge
+    "PdfRebuilder",
     # Advanced Graphics
     "Color",
     "BlendMode",
