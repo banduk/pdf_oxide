@@ -1015,16 +1015,27 @@ pub fn subset_to_bytes(
         return Err(Error::InvalidPdf("no pages selected".to_string()));
     }
     let mut builder = Builder::new(sources, opts);
+
+    // Resolve every source's page-leaf object ids in ONE tree walk per source
+    // (not one walk per page — that would be O(pages²) for large selections).
+    let leaf_ids: Vec<Vec<u32>> = sources.iter().map(|d| all_page_leaf_ids(d)).collect();
+
     // Sever references to any source page we are not keeping, so a link's
     // /Dest can't drag a dropped page (and its whole subtree) back in.
-    for (src_idx, doc) in sources.iter().enumerate() {
+    for (src_idx, leaves) in leaf_ids.iter().enumerate() {
         let kept: HashSet<usize> = picks
             .iter()
             .filter(|(s, _)| *s == src_idx)
             .map(|(_, p)| *p)
             .collect();
-        builder.severed[src_idx] = collect_dropped_page_ids(doc, &kept);
+        builder.severed[src_idx] = leaves
+            .iter()
+            .enumerate()
+            .filter(|(p, _)| !kept.contains(p))
+            .map(|(_, &id)| id)
+            .collect();
     }
+
     // Pre-allocate a new id for every kept page and record (src, source leaf id)
     // -> new id BEFORE building any page, so links and bookmarks on one page can
     // resolve targets on a page that hasn't been built yet.
@@ -1035,7 +1046,7 @@ pub fn subset_to_bytes(
         }
         let pid = builder.alloc();
         builder.pinned.insert(pid);
-        if let Some(leaf) = page_leaf_id(sources[src], page) {
+        if let Some(&leaf) = leaf_ids[src].get(page) {
             builder.page_id_map.insert((src, leaf), pid);
         }
         planned.push((src, page, pid));
@@ -1046,41 +1057,31 @@ pub fn subset_to_bytes(
     builder.finish()
 }
 
-/// Object ids of the pages in `doc` that are NOT in `kept`.
-fn collect_dropped_page_ids(doc: &PdfDocument, kept: &HashSet<usize>) -> HashSet<u32> {
-    let mut dropped = HashSet::new();
-    let total = doc.page_count().unwrap_or(0);
-    for p in 0..total {
-        if kept.contains(&p) {
-            continue;
-        }
-        if let Some(id) = page_leaf_id(doc, p) {
-            dropped.insert(id);
-        }
+/// Leaf-page object ids of `doc` in page order, via a single page-tree walk.
+fn all_page_leaf_ids(doc: &PdfDocument) -> Vec<u32> {
+    let mut leaves = Vec::new();
+    let mut visited = HashSet::new();
+    if let Some(pages_ref) = doc
+        .trailer()
+        .as_dict()
+        .and_then(|d| d.get("Root"))
+        .and_then(|r| r.as_reference())
+        .and_then(|root| doc.load_object(root).ok())
+        .and_then(|cat| cat.as_dict().and_then(|d| d.get("Pages")).and_then(|p| p.as_reference()))
+    {
+        collect_leaf_ids(doc, pages_ref, &mut leaves, &mut visited, 0);
     }
-    dropped
+    leaves
 }
 
-/// Best-effort lookup of a page's leaf object id by walking the page tree.
-fn page_leaf_id(doc: &PdfDocument, page_index: usize) -> Option<u32> {
-    let root = doc.trailer().as_dict()?.get("Root")?.as_reference()?;
-    let catalog = doc.load_object(root).ok()?;
-    let pages_ref = catalog.as_dict()?.get("Pages")?.as_reference()?;
-    let mut counter = 0usize;
-    let mut found = None;
-    walk_pages(doc, pages_ref, &mut counter, page_index, &mut found, 0);
-    found
-}
-
-fn walk_pages(
+fn collect_leaf_ids(
     doc: &PdfDocument,
     node_ref: ObjectRef,
-    counter: &mut usize,
-    target: usize,
-    found: &mut Option<u32>,
+    out: &mut Vec<u32>,
+    visited: &mut HashSet<u32>,
     depth: usize,
 ) {
-    if found.is_some() || depth > MAX_DEPTH {
+    if depth > MAX_DEPTH || !visited.insert(node_ref.id) {
         return;
     }
     let Ok(node) = doc.load_object(node_ref) else {
@@ -1094,19 +1095,12 @@ fn walk_pages(
         if let Some(kids) = dict.get("Kids").and_then(|k| k.as_array()) {
             for kid in kids {
                 if let Some(kref) = kid.as_reference() {
-                    walk_pages(doc, kref, counter, target, found, depth + 1);
-                    if found.is_some() {
-                        return;
-                    }
+                    collect_leaf_ids(doc, kref, out, visited, depth + 1);
                 }
             }
         }
     } else {
-        // Leaf page.
-        if *counter == target {
-            *found = Some(node_ref.id);
-        }
-        *counter += 1;
+        out.push(node_ref.id);
     }
 }
 
