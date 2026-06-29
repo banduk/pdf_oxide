@@ -2814,6 +2814,106 @@ impl PyPdfDocument {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    /// Build a new PDF from only the listed pages, copying just what those pages
+    /// need to preserve their visual + semantic meaning — no orphan objects, and
+    /// duplicate objects (a font/image shared across pages) collapsed to one.
+    /// Internal links and bookmarks are remapped to the kept pages; interactive
+    /// forms, optional-content layers, and catalog metadata are carried over.
+    /// Pages are 0-based and kept in the order given.
+    ///
+    /// Every fidelity layer is individually controllable, so you can trade
+    /// fidelity for speed:
+    ///
+    /// * `dedup` — collapse byte-identical objects (default `True`).
+    /// * `resources` — `"forms"` (trim page + form resources, default),
+    ///   `"page"` (trim page only), or `"wholesale"` (copy resources as-is,
+    ///   fastest).
+    /// * `on_signature` — `"preserve_visual"` (keep the seal, drop the invalid
+    ///   signature; default), `"drop"` (remove the seal too), or `"refuse"`
+    ///   (raise on a signed page).
+    /// * `keep_links`, `keep_outlines`, `keep_struct_tree`, `keep_acroform`,
+    ///   `keep_optional_content`, `keep_catalog_metadata` — all default `True`.
+    ///
+    /// # Example
+    ///
+    /// ```python
+    /// doc = PdfDocument.from_bytes(pdf_bytes)
+    /// just_three = doc.subset_pages([0, 4, 9])
+    /// # speed over fidelity:
+    /// lean = doc.subset_pages([0], resources="wholesale", keep_struct_tree=False)
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        pages,
+        *,
+        dedup = true,
+        resources = "forms",
+        on_signature = "preserve_visual",
+        keep_links = true,
+        keep_outlines = true,
+        keep_struct_tree = true,
+        keep_acroform = true,
+        keep_optional_content = true,
+        keep_catalog_metadata = true,
+    ))]
+    fn subset_pages<'py>(
+        &mut self,
+        py: Python<'py>,
+        pages: Vec<usize>,
+        dedup: bool,
+        resources: &str,
+        on_signature: &str,
+        keep_links: bool,
+        keep_outlines: bool,
+        keep_struct_tree: bool,
+        keep_acroform: bool,
+        keep_optional_content: bool,
+        keep_catalog_metadata: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        use crate::editor::{ResourceTrim, SignaturePolicy, SubsetOptions};
+
+        let resources = match resources {
+            "wholesale" => ResourceTrim::Wholesale,
+            "page" => ResourceTrim::Page,
+            "forms" => ResourceTrim::Forms,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "resources must be 'wholesale', 'page', or 'forms' (got {other:?})"
+                )))
+            },
+        };
+        let on_signature = match on_signature {
+            "preserve_visual" => SignaturePolicy::PreserveVisual,
+            "drop" => SignaturePolicy::Drop,
+            "refuse" => SignaturePolicy::Refuse,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "on_signature must be 'preserve_visual', 'drop', or 'refuse' (got {other:?})"
+                )))
+            },
+        };
+        let opts = SubsetOptions {
+            dedup,
+            on_signature,
+            resources,
+            keep_links,
+            keep_outlines,
+            keep_struct_tree,
+            keep_acroform,
+            keep_optional_content,
+            keep_catalog_metadata,
+        };
+
+        self.ensure_editor()?;
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
+        let (bytes, _report) = editor
+            .subset_pages_with_options(&pages, opts)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// Extract several non-overlapping page ranges in one call. Each range is
     /// `(start, end)` interpreted as `[start, end)`. Returns a list of `bytes`
     /// objects, one per range, in the same order.

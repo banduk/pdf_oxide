@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use crate::content::{parse_content_stream, Operator};
 use crate::object::{Object, ObjectRef};
 
-use super::{Builder, MAX_DEPTH};
+use super::{Builder, ResourceTrim, MAX_DEPTH};
 
 /// Resource names a content stream actually references, per category.
 #[derive(Debug, Default)]
@@ -92,7 +92,7 @@ impl Builder<'_> {
     /// Build a trimmed `/Resources` dictionary holding only the entries the
     /// content actually used, with every kept entry already imported (new-id
     /// references). Used Form XObjects are themselves trimmed when
-    /// `opts.trim_forms` is set; everything else is imported wholesale.
+    /// `opts.resources` is `Forms`; everything else is imported wholesale.
     pub(super) fn build_trimmed_resources(
         &mut self,
         src: usize,
@@ -126,7 +126,9 @@ impl Builder<'_> {
                     continue;
                 }
                 // Trim used Form XObjects; import everything else wholesale.
-                let trim_form = category == "XObject" && self.opts.trim_forms && depth < MAX_DEPTH;
+                let trim_form = category == "XObject"
+                    && self.opts.resources == ResourceTrim::Forms
+                    && depth < MAX_DEPTH;
                 let form_ref = if trim_form {
                     self.form_ref_if_form(src, value)
                 } else {

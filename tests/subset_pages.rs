@@ -757,15 +757,15 @@ fn subset_trims_form_internal_resources() {
     let fixture = build_form_fixture();
     let doc = PdfDocument::from_bytes(fixture).expect("parse");
 
-    // trim_forms ON (default): the form's unused image is dropped.
+    // ResourceTrim::Forms (default): the form's unused image is dropped.
     let (trimmed, _) =
         pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], SubsetOptions::default()).unwrap();
     let out = PdfDocument::from_bytes(trimmed).expect("parse trimmed");
     assert_eq!(form_internal_image_count(&out), 1, "form keeps only its used image");
 
-    // trim_forms OFF: the form is copied wholesale, unused image retained.
+    // ResourceTrim::Page: the form is copied wholesale, unused image retained.
     let opts = SubsetOptions {
-        trim_forms: false,
+        resources: pdf_oxide::editor::ResourceTrim::Page,
         ..SubsetOptions::default()
     };
     let (whole, _) = pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], opts).unwrap();
@@ -924,4 +924,233 @@ fn subset_prunes_structure_tree_to_kept_pages() {
 
     // Text still extracts.
     assert!(out.extract_text(0).unwrap().contains("Page0"));
+}
+
+/// Build a 2-page PDF with an interactive text field on each page, an optional
+/// content layer used by page 0, and catalog metadata (/Lang, /Metadata,
+/// /ViewerPreferences). Page 0's field is "name1"; page 1's is "name2".
+fn build_form_doc_fixture() -> Vec<u8> {
+    fn stream_obj(dict_inner: &str, data: &[u8]) -> Vec<u8> {
+        let mut v = format!("<< {} /Length {} >>\nstream\n", dict_inner, data.len()).into_bytes();
+        v.extend_from_slice(data);
+        v.extend_from_slice(b"\nendstream");
+        v
+    }
+    let xmp = b"<?xpacket?><x:xmpmeta xmlns:x='adobe:ns:meta/'></x:xmpmeta><?xpacket end='r'?>";
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm 20 0 R /OCProperties 30 0 R \
+              /Lang (en-US) /Metadata 35 0 R /ViewerPreferences << /HideToolbar true >> >>"
+                .to_vec(),
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 300 300] >>".to_vec(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R \
+              /Resources << /Font << /F1 10 0 R >> /Properties << /MC0 31 0 R >> >> \
+              /Annots [21 0 R] >>"
+                .to_vec(),
+        ),
+        (4, stream_obj("", b"/OC /MC0 BDC BT /F1 12 Tf 20 250 Td (Page0) Tj ET EMC")),
+        (
+            5,
+            b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R \
+              /Resources << /Font << /F1 10 0 R >> >> /Annots [22 0 R] >>"
+                .to_vec(),
+        ),
+        (6, stream_obj("", b"BT /F1 12 Tf 20 250 Td (Page1) Tj ET")),
+        (10, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (
+            20,
+            b"<< /Fields [21 0 R 22 0 R] /DA (/Helv 0 Tf 0 g) \
+              /DR << /Font << /Helv 10 0 R >> >> /NeedAppearances true >>"
+                .to_vec(),
+        ),
+        (
+            21,
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (name1) /V (Alice) \
+              /Rect [20 20 120 50] /P 3 0 R /AP << /N 23 0 R >> >>"
+                .to_vec(),
+        ),
+        (
+            22,
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (name2) /V (Bob) \
+              /Rect [20 20 120 50] /P 5 0 R /AP << /N 24 0 R >> >>"
+                .to_vec(),
+        ),
+        (23, stream_obj("/Type /XObject /Subtype /Form /BBox [0 0 100 30]", b"q Q")),
+        (24, stream_obj("/Type /XObject /Subtype /Form /BBox [0 0 100 30]", b"q Q")),
+        (30, b"<< /OCGs [31 0 R] /D << /Order [31 0 R] /ON [31 0 R] >> >>".to_vec()),
+        (31, b"<< /Type /OCG /Name (Layer1) >>".to_vec()),
+        (35, stream_obj("/Type /Metadata /Subtype /XML", xmp)),
+    ];
+    let ids: Vec<u32> = objects.iter().map(|(id, _)| *id).collect();
+    let max_id = *ids.iter().max().unwrap() as usize;
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = vec![0usize; max_id + 1];
+    for (id, body) in &objects {
+        offsets[*id as usize] = out.len();
+        out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \r\n");
+    for id in 1..=max_id {
+        if ids.contains(&(id as u32)) {
+            out.extend_from_slice(format!("{:010} 00000 n \r\n", offsets[id]).as_bytes());
+        } else {
+            out.extend_from_slice(b"0000000000 00000 f \r\n");
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            max_id + 1,
+            xref_start
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn catalog_of(doc: &PdfDocument) -> std::collections::HashMap<String, pdf_oxide::object::Object> {
+    doc.catalog().unwrap().as_dict().unwrap().clone()
+}
+
+#[test]
+fn subset_preserves_acroform_layers_and_metadata() {
+    let fixture = build_form_doc_fixture();
+    let doc = PdfDocument::from_bytes(fixture).expect("parse");
+
+    // Keep page 0 (field "name1" + the layer); drop page 1 (field "name2").
+    let (subset, report) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], SubsetOptions::default())
+            .expect("subset");
+    let out = PdfDocument::from_bytes(subset).expect("subset parses");
+    let cat = catalog_of(&out);
+
+    // --- AcroForm: only the kept page's field survives, still interactive ---
+    let acro = cat
+        .get("AcroForm")
+        .and_then(|a| resolve(&out, a))
+        .expect("AcroForm kept");
+    let fields = acro
+        .as_dict()
+        .and_then(|d| d.get("Fields"))
+        .and_then(|f| f.as_array())
+        .unwrap();
+    assert_eq!(fields.len(), 1, "only the kept page's field survives (got {})", fields.len());
+    assert_eq!(report.form_fields, 1);
+    let field = resolve(&out, &fields[0]).unwrap();
+    let fd = field.as_dict().unwrap();
+    assert_eq!(fd.get("FT").and_then(|v| v.as_name()), Some("Tx"), "field type preserved");
+    assert_eq!(
+        fd.get("T").and_then(|v| v.as_string()),
+        Some(&b"name1"[..]),
+        "the kept field is name1 (not the dropped name2)"
+    );
+    assert_eq!(
+        fd.get("V").and_then(|v| v.as_string()),
+        Some(&b"Alice"[..]),
+        "field value preserved (interactive form intact)"
+    );
+
+    // --- Optional content layer carried ---
+    let oc = cat
+        .get("OCProperties")
+        .and_then(|o| resolve(&out, o))
+        .expect("OCProperties kept");
+    assert!(oc.as_dict().and_then(|d| d.get("OCGs")).is_some(), "OCGs carried");
+
+    // --- Catalog metadata carried ---
+    assert_eq!(
+        cat.get("Lang")
+            .and_then(|v| resolve(&out, v))
+            .and_then(|v| v.as_string().map(<[u8]>::to_vec)),
+        Some(b"en-US".to_vec()),
+        "/Lang carried"
+    );
+    assert!(
+        cat.get("Metadata").and_then(|m| resolve(&out, m)).is_some(),
+        "/Metadata carried"
+    );
+    assert!(cat.contains_key("ViewerPreferences"), "/ViewerPreferences carried");
+}
+
+#[test]
+fn subset_keep_acroform_false_drops_the_form() {
+    let fixture = build_form_doc_fixture();
+    let doc = PdfDocument::from_bytes(fixture).expect("parse");
+    let opts = SubsetOptions {
+        keep_acroform: false,
+        ..SubsetOptions::default()
+    };
+    let (subset, _) = pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], opts).expect("subset");
+    let out = PdfDocument::from_bytes(subset).expect("parses");
+    assert!(
+        !catalog_of(&out).contains_key("AcroForm"),
+        "no AcroForm when keep_acroform=false"
+    );
+    // The widget's appearance is still on the page (visual preserved).
+    let page = out.get_page(0).unwrap();
+    assert!(
+        page.as_dict().and_then(|d| d.get("Annots")).is_some(),
+        "widget annotation still present visually"
+    );
+}
+
+#[test]
+fn subset_signature_drop_removes_the_seal() {
+    let fixture = build_signed_fixture();
+    let doc = PdfDocument::from_bytes(fixture).expect("parse");
+    let opts = SubsetOptions {
+        on_signature: SignaturePolicy::Drop,
+        ..SubsetOptions::default()
+    };
+    let (subset, report) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], opts).expect("subset");
+    let out = PdfDocument::from_bytes(subset.clone()).expect("parses");
+    // Drop removes the whole signature widget — seal included.
+    assert_eq!(seal_image_count(&out), 0, "Drop removes the seal entirely");
+    assert!(
+        !subset
+            .windows(b"/ByteRange".len())
+            .any(|w| w == b"/ByteRange"),
+        "no signature dict survives"
+    );
+    assert_eq!(report.dropped_signatures, 1);
+    // Page text is still intact.
+    assert!(out.extract_text(0).unwrap().contains("Signed Page"));
+}
+
+#[test]
+fn subset_resources_wholesale_keeps_unused() {
+    let fixture = build_bloated_fixture();
+    let doc = PdfDocument::from_bytes(fixture).expect("parse");
+
+    // Wholesale: copy /Resources as-is, so the unused inherited font survives.
+    let opts = SubsetOptions {
+        resources: pdf_oxide::editor::ResourceTrim::Wholesale,
+        ..SubsetOptions::default()
+    };
+    let (whole, _) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0), (0, 1)], opts).expect("subset");
+    let (_imgs, fonts) = analyze(&whole, &[0, 1]);
+    assert!(
+        fonts.contains("Courier"),
+        "wholesale keeps the unused inherited font (got {fonts:?})"
+    );
+
+    // Default (Forms) trims it away — the contrast.
+    let (trimmed, _) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0), (0, 1)], SubsetOptions::default())
+            .unwrap();
+    let (_i2, fonts2) = analyze(&trimmed, &[0, 1]);
+    assert!(!fonts2.contains("Courier"), "default trims the unused font");
 }

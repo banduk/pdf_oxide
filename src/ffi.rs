@@ -1289,6 +1289,41 @@ pub extern "C" fn document_editor_extract_pages_to_bytes(
     }
 }
 
+/// Build a new in-memory PDF from only the listed pages, copying just what
+/// those pages need to preserve their visual + semantic meaning — no orphan
+/// objects, and duplicate objects (a font/image shared across pages) collapsed
+/// to one. `pages` is a C array of 0-based page indices; `count` is its length.
+/// See `pdf_oxide::editor::subset`.
+#[no_mangle]
+pub extern "C" fn document_editor_subset_pages_to_bytes(
+    handle: *mut DocumentEditor,
+    pages: *const i32,
+    count: usize,
+    out_len: *mut usize,
+    error_code: *mut i32,
+) -> *mut u8 {
+    if handle.is_null() || pages.is_null() || out_len.is_null() || count == 0 {
+        set_error(error_code, ERR_INVALID_ARG);
+        return ptr::null_mut();
+    }
+    let page_indices: Vec<usize> = unsafe { std::slice::from_raw_parts(pages, count) }
+        .iter()
+        .map(|&i| i as usize)
+        .collect();
+    let editor = handle_mut(handle);
+    match editor.subset_pages(&page_indices) {
+        Ok(bytes) => {
+            set_error(error_code, ERR_SUCCESS);
+            write_out(out_len, bytes.len());
+            vec_to_ffi_bytes(bytes)
+        },
+        Err(e) => {
+            set_error(error_code, classify_error(&e));
+            ptr::null_mut()
+        },
+    }
+}
+
 /// Convert the edited document to PDF/A in-place.
 /// level: 0=A1b 1=A1a 2=A2b 3=A2a 4=A2u 5=A3b 6=A3a 7=A3u
 #[no_mangle]
