@@ -199,6 +199,9 @@ struct Builder<'a> {
     /// kept pages before any destination is remapped, so a link/bookmark on one
     /// page can resolve a target on another.
     page_id_map: HashMap<(usize, u32), u32>,
+    /// (source index, source form-xobject id) -> new id of its *trimmed* copy,
+    /// so a form used by several pages is trimmed + emitted once.
+    form_trim_map: HashMap<(usize, u32), u32>,
 }
 
 impl<'a> Builder<'a> {
@@ -214,6 +217,7 @@ impl<'a> Builder<'a> {
             severed: vec![HashSet::new(); sources.len()],
             page_ids: Vec::new(),
             page_id_map: HashMap::new(),
+            form_trim_map: HashMap::new(),
         }
     }
 
@@ -281,10 +285,38 @@ impl<'a> Builder<'a> {
         dict.iter().map(|(k, v)| (k.clone(), self.remap(src, v, 1))).collect()
     }
 
+    fn keep_set<'b>(used: &'b UsedNames, category: &str) -> Option<&'b HashSet<String>> {
+        Some(match category {
+            "Font" => &used.fonts,
+            "XObject" => &used.xobjects,
+            "ExtGState" => &used.extgstates,
+            "ColorSpace" => &used.colorspaces,
+            "Pattern" => &used.patterns,
+            "Shading" => &used.shadings,
+            "Properties" => &used.properties,
+            _ => return None,
+        })
+    }
+
+    /// If `value` references a Form XObject (not an image), return its ref.
+    fn form_ref_if_form(&self, src: usize, value: &Object) -> Option<ObjectRef> {
+        let r = value.as_reference()?;
+        let o = self.sources[src].load_object(r).ok()?;
+        let st = o.as_dict()?.get("Subtype")?.as_name()?;
+        (st == "Form").then_some(r)
+    }
+
     /// Build a trimmed `/Resources` dictionary holding only the entries the
-    /// page's content actually used. Entries stay as references into the source
-    /// (they get imported by the caller's `remap`).
-    fn trim_resources(&self, src: usize, res: &Object, used: &UsedNames) -> Object {
+    /// content actually used, with every kept entry already imported (new-id
+    /// references). Used Form XObjects are themselves trimmed when
+    /// `opts.trim_forms` is set; everything else is imported wholesale.
+    fn build_trimmed_resources(
+        &mut self,
+        src: usize,
+        res: &Object,
+        used: &UsedNames,
+        depth: usize,
+    ) -> Object {
         let mut out: HashMap<String, Object> = HashMap::new();
         let res_dict = match res {
             Object::Dictionary(d) => d.clone(),
@@ -292,40 +324,83 @@ impl<'a> Builder<'a> {
             _ => return Object::Dictionary(out),
         };
         for category in RESOURCE_CATEGORIES {
-            let keep: &HashSet<String> = match category {
-                "Font" => &used.fonts,
-                "XObject" => &used.xobjects,
-                "ExtGState" => &used.extgstates,
-                "ColorSpace" => &used.colorspaces,
-                "Pattern" => &used.patterns,
-                "Shading" => &used.shadings,
-                "Properties" => &used.properties,
-                _ => continue,
-            };
+            let Some(keep) = Self::keep_set(used, category) else { continue };
             if keep.is_empty() {
                 continue;
             }
+            let keep = keep.clone();
             let Some(sub) = res_dict.get(category).and_then(|c| self.resolve(src, c)) else {
                 continue;
             };
-            let Some(sub_dict) = sub.as_dict() else {
-                continue;
-            };
+            let Some(sub_dict) = sub.as_dict().cloned() else { continue };
             let mut new_sub: HashMap<String, Object> = HashMap::new();
             for (name, value) in sub_dict.iter() {
-                if keep.contains(name) {
-                    new_sub.insert(name.clone(), value.clone());
+                if !keep.contains(name) {
+                    continue;
                 }
+                let imported = if category == "XObject"
+                    && self.opts.trim_forms
+                    && depth < MAX_DEPTH
+                    && self.form_ref_if_form(src, value).is_some()
+                {
+                    let form_ref = self.form_ref_if_form(src, value).unwrap();
+                    let fid = self.import_form_trimmed(src, form_ref, depth + 1);
+                    Object::Reference(ObjectRef::new(fid, 0))
+                } else {
+                    // Wholesale import (handles indirect refs and inline values).
+                    self.remap(src, value, depth + 1)
+                };
+                new_sub.insert(name.clone(), imported);
             }
             if !new_sub.is_empty() {
                 out.insert(category.to_string(), Object::Dictionary(new_sub));
             }
         }
-        // /ProcSet is a tiny legacy hint; carry it through if present.
+        // /ProcSet is a tiny legacy hint with no references; carry it through.
         if let Some(ps) = res_dict.get("ProcSet") {
             out.insert("ProcSet".to_string(), ps.clone());
         }
         Object::Dictionary(out)
+    }
+
+    /// Import a Form XObject as a *trimmed* copy: its own `/Resources` is cut to
+    /// what its content stream references (recursively). Cached so a shared form
+    /// is trimmed once.
+    fn import_form_trimmed(&mut self, src: usize, form_ref: ObjectRef, depth: usize) -> u32 {
+        if let Some(&n) = self.form_trim_map.get(&(src, form_ref.id)) {
+            return n;
+        }
+        let new_id = self.alloc();
+        self.form_trim_map.insert((src, form_ref.id), new_id);
+
+        let form_obj = self.sources[src].load_object(form_ref).unwrap_or(Object::Null);
+        let (dict, data) = match &form_obj {
+            Object::Stream { dict, data } => (dict.clone(), data.clone()),
+            // Not a stream (shouldn't happen for /Subtype /Form) — copy wholesale.
+            other => {
+                let remapped = self.remap(src, other, depth + 1);
+                self.objects.insert(new_id, remapped);
+                return new_id;
+            },
+        };
+
+        let content = form_obj.decode_stream_data().unwrap_or_default();
+        let mut used = UsedNames::default();
+        scan_used(&content, &mut used);
+
+        let mut nd: HashMap<String, Object> = HashMap::new();
+        for (k, v) in &dict {
+            if k == "Resources" {
+                continue;
+            }
+            nd.insert(k.clone(), self.remap(src, v, depth + 1));
+        }
+        if let Some(fr) = dict.get("Resources").and_then(|r| self.resolve(src, r)) {
+            let trimmed = self.build_trimmed_resources(src, &fr, &used, depth + 1);
+            nd.insert("Resources".to_string(), trimmed);
+        }
+        self.objects.insert(new_id, Object::Stream { dict: nd, data });
+        new_id
     }
 
     /// Does this annotation dict represent a signature widget?
@@ -376,11 +451,10 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Trimmed resources.
+        // Trimmed resources (already imported as new-id refs; insert directly).
         if let Some(res) = page_dict.get("Resources").and_then(|r| self.resolve(src, r)) {
-            let trimmed = self.trim_resources(src, &res, &used);
-            let remapped = self.remap(src, &trimmed, 1);
-            new_page.insert("Resources".to_string(), remapped);
+            let trimmed = self.build_trimmed_resources(src, &res, &used, 0);
+            new_page.insert("Resources".to_string(), trimmed);
         }
 
         // Content streams (copied verbatim — raw, still-encoded).

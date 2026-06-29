@@ -583,3 +583,108 @@ fn subset_remaps_links_and_prunes_outlines() {
     assert!(!p1_link_has_dest, "page 1's link to a dropped page is severed");
     assert!(report.links_severed >= 1, "at least one link was severed");
 }
+
+/// Build a 1-page PDF whose page uses a Form XObject; the form's OWN
+/// /Resources list a used image and an unused image.
+fn build_form_fixture() -> Vec<u8> {
+    fn stream_obj(dict_inner: &str, data: &[u8]) -> Vec<u8> {
+        let mut v = format!("<< {} /Length {} >>\nstream\n", dict_inner, data.len()).into_bytes();
+        v.extend_from_slice(data);
+        v.extend_from_slice(b"\nendstream");
+        v
+    }
+    let img = "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+               /ColorSpace /DeviceGray /BitsPerComponent 8";
+    let img2 = "/Type /XObject /Subtype /Image /Width 2 /Height 1 \
+                /ColorSpace /DeviceGray /BitsPerComponent 8";
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] \
+              /Resources << /XObject << /Fm 20 0 R >> >> >>"
+                .to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>".to_vec()),
+        (4, stream_obj("", b"q 100 0 0 100 0 0 cm /Fm Do Q")),
+        (
+            20,
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                 /Resources << /XObject << /ImUsed 21 0 R /ImUnused 22 0 R >> >>",
+                b"q 50 0 0 50 0 0 cm /ImUsed Do Q",
+            ),
+        ),
+        (21, stream_obj(img, &[0xFFu8])),
+        (22, stream_obj(img2, &[0x00u8, 0x00u8])),
+    ];
+    let ids: Vec<u32> = objects.iter().map(|(id, _)| *id).collect();
+    let max_id = *ids.iter().max().unwrap() as usize;
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = vec![0usize; max_id + 1];
+    for (id, body) in &objects {
+        offsets[*id as usize] = out.len();
+        out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \r\n");
+    for id in 1..=max_id {
+        if ids.contains(&(id as u32)) {
+            out.extend_from_slice(format!("{:010} 00000 n \r\n", offsets[id]).as_bytes());
+        } else {
+            out.extend_from_slice(b"0000000000 00000 f \r\n");
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            max_id + 1,
+            xref_start
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// Count image XObjects inside the page's form `/Fm`'s own /Resources.
+fn form_internal_image_count(doc: &PdfDocument) -> usize {
+    let page = doc.get_page(0).expect("page");
+    let res = page.as_dict().and_then(|d| d.get("Resources")).and_then(|r| resolve(doc, r)).unwrap();
+    let xo = res.as_dict().and_then(|d| d.get("XObject")).and_then(|x| resolve(doc, x)).unwrap();
+    let fm = xo.as_dict().and_then(|d| d.get("Fm")).and_then(|f| resolve(doc, f)).unwrap();
+    let fres = fm.as_dict().and_then(|d| d.get("Resources")).and_then(|r| resolve(doc, r)).unwrap();
+    let fxo = fres.as_dict().and_then(|d| d.get("XObject")).and_then(|x| resolve(doc, x));
+    let Some(fxo) = fxo else { return 0 };
+    fxo.as_dict()
+        .map(|d| {
+            d.values()
+                .filter(|v| {
+                    resolve(doc, v)
+                        .and_then(|o| o.as_dict().and_then(|dd| dd.get("Subtype")).and_then(|s| s.as_name()).map(String::from))
+                        == Some("Image".to_string())
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn subset_trims_form_internal_resources() {
+    let fixture = build_form_fixture();
+    let doc = PdfDocument::from_bytes(fixture).expect("parse");
+
+    // trim_forms ON (default): the form's unused image is dropped.
+    let (trimmed, _) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], SubsetOptions::default()).unwrap();
+    let out = PdfDocument::from_bytes(trimmed).expect("parse trimmed");
+    assert_eq!(form_internal_image_count(&out), 1, "form keeps only its used image");
+
+    // trim_forms OFF: the form is copied wholesale, unused image retained.
+    let opts = SubsetOptions { trim_forms: false, ..SubsetOptions::default() };
+    let (whole, _) = pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], opts).unwrap();
+    let out2 = PdfDocument::from_bytes(whole).expect("parse whole");
+    assert_eq!(form_internal_image_count(&out2), 2, "wholesale form keeps both images");
+}
