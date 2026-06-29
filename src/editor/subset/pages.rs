@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::object::{Object, ObjectRef};
 
 use super::resources::{scan_used, UsedNames};
-use super::{Builder, SignaturePolicy};
+use super::{Builder, ResourceTrim, SignaturePolicy};
 
 /// Page dictionary keys carried verbatim (besides the ones we rebuild:
 /// `/Type`, `/Parent`, `/Resources`, `/Contents`, `/Annots`).
@@ -42,13 +42,17 @@ impl Builder<'_> {
             }
         }
 
-        // Trimmed resources (already imported as new-id refs; insert directly).
-        if let Some(res) = page_dict
-            .get("Resources")
-            .and_then(|r| self.resolve(src, r))
-        {
-            let trimmed = self.build_trimmed_resources(src, &res, &used, 0);
-            new_page.insert("Resources".to_string(), trimmed);
+        // Resources: copied wholesale, or trimmed to what's referenced (already
+        // imported as new-id refs; insert directly).
+        if let Some(res_val) = page_dict.get("Resources") {
+            let resources = if self.opts.resources == ResourceTrim::Wholesale {
+                self.remap(src, res_val, 1)
+            } else if let Some(res) = self.resolve(src, res_val) {
+                self.build_trimmed_resources(src, &res, &used, 0)
+            } else {
+                Object::Dictionary(HashMap::new())
+            };
+            new_page.insert("Resources".to_string(), resources);
         }
 
         // Content streams (copied verbatim — raw, still-encoded).
@@ -162,6 +166,14 @@ impl Builder<'_> {
                         "page {page_index}: digital signature dropped (rebuild invalidates it); \
                          visual appearance preserved"
                     ));
+                },
+                SignaturePolicy::Drop => {
+                    // Drop the signature entirely, including its visual seal.
+                    self.report.dropped_signatures += 1;
+                    self.report.warnings.push(format!(
+                        "page {page_index}: digital signature dropped entirely (seal removed)"
+                    ));
+                    return Ok(None);
                 },
             }
         }

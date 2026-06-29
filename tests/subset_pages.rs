@@ -757,15 +757,15 @@ fn subset_trims_form_internal_resources() {
     let fixture = build_form_fixture();
     let doc = PdfDocument::from_bytes(fixture).expect("parse");
 
-    // trim_forms ON (default): the form's unused image is dropped.
+    // ResourceTrim::Forms (default): the form's unused image is dropped.
     let (trimmed, _) =
         pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], SubsetOptions::default()).unwrap();
     let out = PdfDocument::from_bytes(trimmed).expect("parse trimmed");
     assert_eq!(form_internal_image_count(&out), 1, "form keeps only its used image");
 
-    // trim_forms OFF: the form is copied wholesale, unused image retained.
+    // ResourceTrim::Page: the form is copied wholesale, unused image retained.
     let opts = SubsetOptions {
-        trim_forms: false,
+        resources: pdf_oxide::editor::ResourceTrim::Page,
         ..SubsetOptions::default()
     };
     let (whole, _) = pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], opts).unwrap();
@@ -1103,4 +1103,54 @@ fn subset_keep_acroform_false_drops_the_form() {
         page.as_dict().and_then(|d| d.get("Annots")).is_some(),
         "widget annotation still present visually"
     );
+}
+
+#[test]
+fn subset_signature_drop_removes_the_seal() {
+    let fixture = build_signed_fixture();
+    let doc = PdfDocument::from_bytes(fixture).expect("parse");
+    let opts = SubsetOptions {
+        on_signature: SignaturePolicy::Drop,
+        ..SubsetOptions::default()
+    };
+    let (subset, report) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], opts).expect("subset");
+    let out = PdfDocument::from_bytes(subset.clone()).expect("parses");
+    // Drop removes the whole signature widget — seal included.
+    assert_eq!(seal_image_count(&out), 0, "Drop removes the seal entirely");
+    assert!(
+        !subset
+            .windows(b"/ByteRange".len())
+            .any(|w| w == b"/ByteRange"),
+        "no signature dict survives"
+    );
+    assert_eq!(report.dropped_signatures, 1);
+    // Page text is still intact.
+    assert!(out.extract_text(0).unwrap().contains("Signed Page"));
+}
+
+#[test]
+fn subset_resources_wholesale_keeps_unused() {
+    let fixture = build_bloated_fixture();
+    let doc = PdfDocument::from_bytes(fixture).expect("parse");
+
+    // Wholesale: copy /Resources as-is, so the unused inherited font survives.
+    let opts = SubsetOptions {
+        resources: pdf_oxide::editor::ResourceTrim::Wholesale,
+        ..SubsetOptions::default()
+    };
+    let (whole, _) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0), (0, 1)], opts).expect("subset");
+    let (_imgs, fonts) = analyze(&whole, &[0, 1]);
+    assert!(
+        fonts.contains("Courier"),
+        "wholesale keeps the unused inherited font (got {fonts:?})"
+    );
+
+    // Default (Forms) trims it away — the contrast.
+    let (trimmed, _) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0), (0, 1)], SubsetOptions::default())
+            .unwrap();
+    let (_i2, fonts2) = analyze(&trimmed, &[0, 1]);
+    assert!(!fonts2.contains("Courier"), "default trims the unused font");
 }

@@ -105,5 +105,6 @@ pub use form_fields::{
 };
 pub use resource_manager::ResourceManager;
 pub use subset::{
-    subset_pdf_bytes, subset_to_bytes, PdfRebuilder, SignaturePolicy, SubsetOptions, SubsetReport,
+    subset_pdf_bytes, subset_to_bytes, PdfRebuilder, ResourceTrim, SignaturePolicy, SubsetOptions,
+    SubsetReport,
 };

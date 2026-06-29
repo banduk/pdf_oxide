@@ -1062,3 +1062,27 @@ class TestSubsetPages:
         doc = _make_simple_doc()
         with pytest.raises(Exception):  # noqa: B017
             doc.subset_pages([999])
+
+    def test_subset_pages_options_are_accepted(self):
+        doc = _make_multipage_doc()
+        out = doc.subset_pages(
+            [0],
+            dedup=False,
+            resources="wholesale",
+            on_signature="drop",
+            keep_links=False,
+            keep_outlines=False,
+            keep_struct_tree=False,
+            keep_acroform=False,
+            keep_optional_content=False,
+            keep_catalog_metadata=False,
+        )
+        assert out[:5] == _PDF_MAGIC
+        assert PdfDocument.from_bytes(out).page_count() == 1
+
+    def test_subset_pages_bad_option_value_raises(self):
+        doc = _make_simple_doc()
+        with pytest.raises(ValueError):
+            doc.subset_pages([0], resources="bogus")
+        with pytest.raises(ValueError):
+            doc.subset_pages([0], on_signature="bogus")

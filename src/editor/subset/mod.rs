@@ -29,7 +29,7 @@
 //! ## Forms
 //!
 //! A Form XObject the page uses is copied with its own `/Resources` trimmed to
-//! what the form draws (`SubsetOptions::trim_forms`).
+//! what the form draws (`SubsetOptions::resources` = [`ResourceTrim::Forms`]).
 //!
 //! ## Signatures
 //!
@@ -70,8 +70,24 @@ pub enum SignaturePolicy {
     /// annotation, drop the now-invalid signature value + `/AcroForm`, and warn.
     #[default]
     PreserveVisual,
+    /// Drop the signature entirely — including its visual seal — and warn.
+    Drop,
     /// Refuse to subset a document whose kept pages contain a signature.
     Refuse,
+}
+
+/// How aggressively to trim each page's `/Resources`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResourceTrim {
+    /// Copy each page's `/Resources` as-is (fastest; keeps unused entries from a
+    /// shared/inherited dict).
+    Wholesale,
+    /// Trim page-level `/Resources` to what the content references; copy used
+    /// Form XObjects wholesale.
+    Page,
+    /// Also trim each used Form XObject's own `/Resources` recursively (default).
+    #[default]
+    Forms,
 }
 
 /// Options controlling a subset / rebuild.
@@ -89,9 +105,8 @@ pub struct SubsetOptions {
     pub keep_outlines: bool,
     /// Keep the tagged-PDF structure tree, pruned to the kept pages.
     pub keep_struct_tree: bool,
-    /// Recurse into Form XObjects and trim their `/Resources` too (otherwise a
-    /// used form is copied wholesale).
-    pub trim_forms: bool,
+    /// How aggressively to trim page (and Form XObject) `/Resources`.
+    pub resources: ResourceTrim,
     /// Keep interactive form fields (`/AcroForm`) whose widgets land on kept
     /// pages, with the `/Fields` tree pruned + relinked. When off, widget
     /// appearances are still kept but the form becomes non-interactive.
@@ -112,7 +127,7 @@ impl Default for SubsetOptions {
             keep_links: true,
             keep_outlines: true,
             keep_struct_tree: true,
-            trim_forms: true,
+            resources: ResourceTrim::default(),
             keep_acroform: true,
             keep_optional_content: true,
             keep_catalog_metadata: true,
