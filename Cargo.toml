@@ -527,6 +527,10 @@ name = "pdf_extraction_performance"
 harness = false
 
 [[bench]]
+name = "subset_bench"
+harness = false
+
+[[bench]]
 name = "word_boundary_benchmarks"
 harness = false
 
