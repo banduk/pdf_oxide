@@ -1,0 +1,109 @@
+//! Quick debug-build timing harness for subsetting (run with
+//! `cargo test --test subset_timing -- --ignored --nocapture`). Not a gate;
+//! the criterion bench (`benches/subset_bench.rs`) is the real measurement.
+
+use pdf_oxide::editor::{subset_to_bytes, SubsetOptions};
+use pdf_oxide::PdfDocument;
+use std::time::Instant;
+
+const PAGES: usize = 120;
+const IMG_COUNT: usize = 80;
+const IMG_KB: usize = 16;
+const IMGS_PER_PAGE: usize = 4;
+
+fn build_doc() -> Vec<u8> {
+    let img_base = 10u32;
+    let page_base = img_base + IMG_COUNT as u32;
+    let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
+    objects.push((3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()));
+    let unique = IMG_COUNT / 2;
+    for i in 0..IMG_COUNT {
+        let data = vec![(i % unique) as u8; IMG_KB * 1024];
+        let mut body = format!(
+            "<< /Type /XObject /Subtype /Image /Width 64 /Height {} /ColorSpace /DeviceGray \
+             /BitsPerComponent 8 /Length {} >>\nstream\n",
+            (IMG_KB * 1024) / 64,
+            data.len()
+        )
+        .into_bytes();
+        body.extend_from_slice(&data);
+        body.extend_from_slice(b"\nendstream");
+        objects.push((img_base + i as u32, body));
+    }
+    let mut kids = String::new();
+    for p in 0..PAGES {
+        let pid = page_base + (p as u32) * 2;
+        let cid = pid + 1;
+        kids.push_str(&format!("{pid} 0 R "));
+        let mut xobj = String::new();
+        let mut content = String::from("BT /F1 12 Tf 20 700 Td (Page) Tj ET\n");
+        for k in 0..IMGS_PER_PAGE {
+            let img_idx = (p * IMGS_PER_PAGE + k) % IMG_COUNT;
+            xobj.push_str(&format!("/Im{k} {} 0 R ", img_base + img_idx as u32));
+            content.push_str(&format!("q 64 0 0 64 {} 100 cm /Im{k} Do Q\n", 20 + k * 70));
+        }
+        objects.push((
+            pid,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {cid} 0 R \
+                 /Resources << /Font << /F1 3 0 R >> /XObject << {xobj}>> >> >>"
+            )
+            .into_bytes(),
+        ));
+        let mut cbody = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        cbody.extend_from_slice(content.as_bytes());
+        cbody.extend_from_slice(b"\nendstream");
+        objects.push((cid, cbody));
+    }
+    objects.push((1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()));
+    objects.push((2, format!("<< /Type /Pages /Kids [{kids}] /Count {PAGES} >>").into_bytes()));
+
+    let max_id = objects.iter().map(|(id, _)| *id).max().unwrap() as usize;
+    let present: std::collections::HashSet<u32> = objects.iter().map(|(id, _)| *id).collect();
+    let mut offsets = vec![0usize; max_id + 1];
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    for (id, body) in &objects {
+        offsets[*id as usize] = out.len();
+        out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \r\n");
+    for id in 1..=max_id {
+        if present.contains(&(id as u32)) {
+            out.extend_from_slice(format!("{:010} 00000 n \r\n", offsets[id]).as_bytes());
+        } else {
+            out.extend_from_slice(b"0000000000 00000 f \r\n");
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            max_id + 1,
+            xref_start
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+#[ignore]
+fn timing_subset_half() {
+    let doc = PdfDocument::from_bytes(build_doc()).unwrap();
+    let keep: Vec<(usize, usize)> = (0..PAGES / 2).map(|p| (0usize, p)).collect();
+    // warm
+    let _ = subset_to_bytes(&[&doc], &keep, SubsetOptions::default()).unwrap();
+    let runs = 10;
+    let t = Instant::now();
+    let mut last = 0usize;
+    for _ in 0..runs {
+        let (out, rep) = subset_to_bytes(&[&doc], &keep, SubsetOptions::default()).unwrap();
+        last = out.len();
+        std::hint::black_box(&rep);
+    }
+    let per = t.elapsed() / runs;
+    println!("DEDUP_ON  per-run={per:?} out_bytes={last}");
+}

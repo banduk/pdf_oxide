@@ -2,6 +2,12 @@
 
 All notable changes to PDFOxide are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **Page subsetting and multi-source rebuild (`pdf_oxide::editor::subset`)** — build a brand-new PDF from a selection of source pages, copying **only** the objects those pages truly need to preserve their visual and semantic meaning. Per-page `/Resources` are trimmed to the names the content stream actually references (dropping the classic "extract one page, drag in every font in the document" bloat from a shared/inherited `/Resources`), and byte-identical objects — a font or image shared across pages or across source documents — are collapsed to one via a content-hash fixpoint, with a final reachability pass guaranteeing no orphan objects. Semantic structures are carried over and pruned to the kept pages: internal link/GoTo destinations and outline (bookmark) entries are remapped to kept pages (and severed/pruned when their target is dropped), the tagged-PDF structure tree (`/StructTreeRoot`, `/ParentTree`, `/StructParents`, `/MarkInfo`) is pruned, and Form XObjects' own resources are trimmed recursively. Digital signatures are handled explicitly: because any rebuild invalidates the signed byte range, the default `SignaturePolicy::PreserveVisual` keeps a signature widget's appearance (e.g. the gov.br seal image) as an ordinary annotation while dropping the now-invalid signature value and `/AcroForm`, so the output never carries a `/ByteRange` dictionary that *looks* signed but would fail validation; `SignaturePolicy::Refuse` rejects subsetting a signed page instead. Surfaces: `DocumentEditor::subset_pages` / `subset_pages_with_options`, `PdfRebuilder` (multi-source), `subset_to_bytes`, `subset_pdf_bytes`, and the `SubsetOptions` / `SubsetReport` / `SignaturePolicy` types. Each behaviour is individually toggleable via `SubsetOptions` (`dedup`, `keep_links`, `keep_outlines`, `keep_struct_tree`, `trim_forms`, `on_signature`).
+
 ## [0.3.69] - 2026-06-27
 
 > Language-bindings release — idiomatic bindings for **C++, Swift, Kotlin, Dart, R, Julia, Zig, Scala, Clojure, Objective-C, and Elixir**, each over the stable C ABI, with per-language CI, package-registry publishing, cross-language regression examples, and single-source version management.
