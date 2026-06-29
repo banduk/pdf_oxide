@@ -750,6 +750,32 @@ impl DocumentEditor {
         Ok(cursor.into_inner())
     }
 
+    /// Build a brand-new PDF containing only the listed pages, copying only the
+    /// objects required to preserve their visual and semantic meaning — no
+    /// orphan objects, and duplicate objects (e.g. a font or image shared
+    /// across pages) collapsed to one. See [`crate::editor::subset`].
+    ///
+    /// Any pending edits are captured first (the subset reflects the current
+    /// state). Pages are taken in the order given.
+    pub fn subset_pages(&mut self, pages: &[usize]) -> Result<Vec<u8>> {
+        self.subset_pages_with_options(pages, crate::editor::subset::SubsetOptions::default())
+            .map(|(bytes, _report)| bytes)
+    }
+
+    /// [`Self::subset_pages`] with explicit options, also returning a report
+    /// (warnings, dropped signatures, dedup counts).
+    pub fn subset_pages_with_options(
+        &mut self,
+        pages: &[usize],
+        opts: crate::editor::subset::SubsetOptions,
+    ) -> Result<(Vec<u8>, crate::editor::subset::SubsetReport)> {
+        // Capture the current state (including staged edits) before subsetting.
+        let bytes = self.save_to_bytes()?;
+        let doc = PdfDocument::from_bytes(bytes)?;
+        let picks: Vec<(usize, usize)> = pages.iter().map(|&p| (0usize, p)).collect();
+        crate::editor::subset::subset_to_bytes(&[&doc], &picks, opts)
+    }
+
     /// Find the maximum object ID in the document.
     fn find_max_object_id(doc: &PdfDocument) -> u32 {
         // Get /Size from trailer - this is the number of xref entries (max ID + 1)

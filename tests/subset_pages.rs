@@ -1,0 +1,424 @@
+//! Page subsetting: keep only the selected pages, carrying only the objects
+//! they truly need (no garbage) and collapsing duplicates (no duplication).
+//!
+//! The fixture is built by hand so it exhibits the two things the naive
+//! `extract_pages_to_bytes` path cannot handle:
+//!
+//!  * a **shared / inherited** `/Resources` dictionary on the `/Pages` node that
+//!    lists fonts and images *not used* by every page (the classic "extract one
+//!    page, drag in the whole document's fonts" bloat), and
+//!  * two **byte-identical** image objects used on different pages (a dedup
+//!    target), alongside a genuinely unused image (garbage).
+
+use std::collections::{BTreeSet, HashSet};
+
+use pdf_oxide::editor::{DocumentEditor, SignaturePolicy, SubsetOptions};
+use pdf_oxide::PdfDocument;
+
+/// Build a 3-page PDF with inherited shared resources containing garbage and
+/// duplicate images.
+///
+/// Object map:
+///  1 Catalog, 2 Pages(+inherited /Resources 9, /MediaBox), 3/5/7 Pages,
+///  4/6/8 content streams, 9 shared Resources,
+///  10 FUsed(Helvetica), 11 FUnused(Courier — garbage),
+///  12 ImA, 13 ImB (byte-identical to 12 — dedup), 14 ImUnused (garbage).
+///
+///  Page1 uses FUsed+ImA, Page2 uses FUsed+ImB, Page3 uses FUsed only.
+fn build_bloated_fixture() -> Vec<u8> {
+    fn stream_obj(dict_inner: &str, data: &[u8]) -> Vec<u8> {
+        let mut v = format!("<< {} /Length {} >>\nstream\n", dict_inner, data.len()).into_bytes();
+        v.extend_from_slice(data);
+        v.extend_from_slice(b"\nendstream");
+        v
+    }
+
+    let content1 = b"BT /FUsed 12 Tf 20 100 Td (Page1) Tj ET\nq 50 0 0 50 20 20 cm /ImA Do Q".to_vec();
+    let content2 = b"BT /FUsed 12 Tf 20 100 Td (Page2) Tj ET\nq 50 0 0 50 20 20 cm /ImB Do Q".to_vec();
+    let content3 = b"BT /FUsed 12 Tf 20 100 Td (Page3) Tj ET".to_vec();
+
+    // A 1x1 gray pixel — ImA and ImB share these exact bytes.
+    let img_shared = [0xFFu8];
+    // A different image — never referenced by any kept page.
+    let img_unused = [0x00u8, 0x00u8];
+
+    let img_dict = "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                    /ColorSpace /DeviceGray /BitsPerComponent 8";
+    let img_unused_dict = "/Type /XObject /Subtype /Image /Width 2 /Height 1 \
+                           /ColorSpace /DeviceGray /BitsPerComponent 8";
+
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 \
+              /MediaBox [0 0 200 200] /Resources 9 0 R >>"
+                .to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>".to_vec()),
+        (4, stream_obj("", &content1)),
+        (5, b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_vec()),
+        (6, stream_obj("", &content2)),
+        (7, b"<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>".to_vec()),
+        (8, stream_obj("", &content3)),
+        (
+            9,
+            b"<< /Font << /FUsed 10 0 R /FUnused 11 0 R >> \
+              /XObject << /ImA 12 0 R /ImB 13 0 R /ImUnused 14 0 R >> >>"
+                .to_vec(),
+        ),
+        (10, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (11, b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".to_vec()),
+        (12, stream_obj(img_dict, &img_shared)),
+        (13, stream_obj(img_dict, &img_shared)),
+        (14, stream_obj(img_unused_dict, &img_unused)),
+    ];
+
+    let max_id = 14usize;
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = vec![0usize; max_id + 1];
+    for (id, body) in &objects {
+        offsets[*id as usize] = out.len();
+        out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \r\n");
+    for id in 1..=max_id {
+        out.extend_from_slice(format!("{:010} 00000 n \r\n", offsets[id]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            max_id + 1,
+            xref_start
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// Resolve a value that may be an indirect reference.
+fn resolve(doc: &PdfDocument, obj: &pdf_oxide::object::Object) -> Option<pdf_oxide::object::Object> {
+    match obj {
+        pdf_oxide::object::Object::Reference(r) => doc.load_object(*r).ok(),
+        other => Some(other.clone()),
+    }
+}
+
+/// Distinct image-XObject object ids and the set of /BaseFont names that the
+/// given pages reference through their (possibly inherited) /Resources.
+fn analyze(bytes: &[u8], pages: &[usize]) -> (HashSet<u32>, BTreeSet<String>) {
+    let doc = PdfDocument::from_bytes(bytes.to_vec()).expect("parse subset output");
+    let mut image_ids = HashSet::new();
+    let mut basefonts = BTreeSet::new();
+
+    for &p in pages {
+        let page = doc.get_page(p).expect("get_page");
+        let page_dict = page.as_dict().expect("page dict");
+        let Some(res) = page_dict.get("Resources").and_then(|r| resolve(&doc, r)) else {
+            continue;
+        };
+        let Some(res_dict) = res.as_dict() else { continue };
+
+        if let Some(xo) = res_dict.get("XObject").and_then(|x| resolve(&doc, x)) {
+            if let Some(xo_dict) = xo.as_dict() {
+                for v in xo_dict.values() {
+                    if let Some(r) = v.as_reference() {
+                        if let Ok(obj) = doc.load_object(r) {
+                            let is_image = obj
+                                .as_dict()
+                                .and_then(|d| d.get("Subtype"))
+                                .and_then(|s| s.as_name())
+                                == Some("Image");
+                            if is_image {
+                                image_ids.insert(r.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(fo) = res_dict.get("Font").and_then(|f| resolve(&doc, f)) {
+            if let Some(fo_dict) = fo.as_dict() {
+                for v in fo_dict.values() {
+                    if let Some(obj) = resolve(&doc, v) {
+                        if let Some(name) =
+                            obj.as_dict().and_then(|d| d.get("BaseFont")).and_then(|b| b.as_name())
+                        {
+                            basefonts.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (image_ids, basefonts)
+}
+
+#[test]
+fn subset_preserves_text_drops_garbage_and_dedups() {
+    let fixture = build_bloated_fixture();
+
+    // Sanity: the fixture parses and has 3 pages.
+    let probe = PdfDocument::from_bytes(fixture.clone()).expect("fixture parses");
+    assert_eq!(probe.page_count().unwrap(), 3);
+
+    // Subset to pages 1 and 2 (0-indexed 0 and 1).
+    let mut editor = DocumentEditor::from_bytes(fixture.clone()).expect("open editor");
+    let (subset, report) = editor
+        .subset_pages_with_options(&[0, 1], SubsetOptions::default())
+        .expect("subset");
+
+    // --- Visual / semantic meaning preserved ---
+    let out = PdfDocument::from_bytes(subset.clone()).expect("subset parses");
+    assert_eq!(out.page_count().unwrap(), 2, "kept exactly the two pages");
+    assert!(out.extract_text(0).unwrap().contains("Page1"), "page 1 text preserved");
+    assert!(out.extract_text(1).unwrap().contains("Page2"), "page 2 text preserved");
+
+    // --- No garbage, no duplication ---
+    let (images, fonts) = analyze(&subset, &[0, 1]);
+    assert_eq!(
+        images.len(),
+        1,
+        "ImA and ImB are byte-identical -> one shared image object; ImUnused dropped (got {images:?})"
+    );
+    assert_eq!(
+        fonts,
+        BTreeSet::from(["Helvetica".to_string()]),
+        "only the used font survives; the unused Courier is dropped (got {fonts:?})"
+    );
+    assert!(report.objects_deduped >= 1, "the duplicate image was deduplicated");
+    assert_eq!(report.dropped_signatures, 0);
+
+    // --- Contrast: the existing extract path keeps the inherited garbage ---
+    let mut editor2 = DocumentEditor::from_bytes(fixture).expect("open editor 2");
+    let naive = editor2.extract_pages_to_bytes(&[0, 1]).expect("extract_pages_to_bytes");
+    let (naive_images, naive_fonts) = analyze(&naive, &[0, 1]);
+    assert!(
+        naive_images.len() > images.len() || naive_fonts.len() > fonts.len(),
+        "the naive extract still drags in unused inherited resources \
+         (images {} vs {}, fonts {:?} vs {:?})",
+        naive_images.len(),
+        images.len(),
+        naive_fonts,
+        fonts
+    );
+}
+
+/// Build a 2-page PDF whose first page carries a gov.br-style *visible* digital
+/// signature: an `/AcroForm` `/FT /Sig` widget whose `/AP /N` form XObject draws
+/// a seal image, with `/V` pointing at a `/Type /Sig` dictionary (`/ByteRange`,
+/// `/Contents`). The signature is structurally faithful (what subsetting must
+/// handle); its CMS is a placeholder — cryptographic validity is irrelevant to
+/// how a rebuild treats it.
+///
+/// Object map:
+///  1 Catalog(+/AcroForm 20), 2 Pages, 3 Page1(+/Annots 21), 4 content1,
+///  5 Page2, 6 content2, 10 Font, 12 seal image,
+///  20 AcroForm, 21 Sig widget, 22 /Type /Sig dict, 23 /AP form XObject.
+fn build_signed_fixture() -> Vec<u8> {
+    fn stream_obj(dict_inner: &str, data: &[u8]) -> Vec<u8> {
+        let mut v = format!("<< {} /Length {} >>\nstream\n", dict_inner, data.len()).into_bytes();
+        v.extend_from_slice(data);
+        v.extend_from_slice(b"\nendstream");
+        v
+    }
+
+    let content1 = b"BT /F1 12 Tf 20 250 Td (Signed Page) Tj ET".to_vec();
+    let content2 = b"BT /F1 12 Tf 20 250 Td (Plain Page) Tj ET".to_vec();
+    // The "seal": a red pixel standing in for the gov.br stamp image.
+    let seal = [0xFFu8, 0x00, 0x00];
+    let ap_stream = b"q 100 0 0 60 0 0 cm /Seal Do Q".to_vec();
+    // Placeholder CMS contents for the signature dict (not a real signature).
+    let sig_contents = "<0000000000000000>";
+
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 20 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 300 300] >>".to_vec(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R \
+              /Resources << /Font << /F1 10 0 R >> >> /Annots [21 0 R] >>"
+                .to_vec(),
+        ),
+        (4, stream_obj("", &content1)),
+        (
+            5,
+            b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R \
+              /Resources << /Font << /F1 10 0 R >> >> >>"
+                .to_vec(),
+        ),
+        (6, stream_obj("", &content2)),
+        (10, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (
+            12,
+            stream_obj(
+                "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+                &seal,
+            ),
+        ),
+        (20, b"<< /Fields [21 0 R] /SigFlags 3 >>".to_vec()),
+        (
+            21,
+            b"<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [20 20 120 80] \
+              /P 3 0 R /T (Signature1) /V 22 0 R /AP << /N 23 0 R >> >>"
+                .to_vec(),
+        ),
+        (
+            22,
+            format!(
+                "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached \
+                 /ByteRange [0 100 200 100] /Contents {sig_contents} /M (D:20240101000000Z) >>"
+            )
+            .into_bytes(),
+        ),
+        (
+            23,
+            stream_obj(
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 60] \
+                 /Resources << /XObject << /Seal 12 0 R >> >>",
+                &ap_stream,
+            ),
+        ),
+    ];
+
+    let ids: Vec<u32> = objects.iter().map(|(id, _)| *id).collect();
+    let max_id = *ids.iter().max().unwrap() as usize;
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = vec![0usize; max_id + 1];
+    for (id, body) in &objects {
+        offsets[*id as usize] = out.len();
+        out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \r\n");
+    for id in 1..=max_id {
+        // Free entry for object numbers we never allocated (7,8,9,11,13..19).
+        if ids.contains(&(id as u32)) {
+            out.extend_from_slice(format!("{:010} 00000 n \r\n", offsets[id]).as_bytes());
+        } else {
+            out.extend_from_slice(b"0000000000 00000 f \r\n");
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            max_id + 1,
+            xref_start
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// Does page 0's signature widget still carry its seal image through `/AP`?
+fn seal_image_count(doc: &PdfDocument) -> usize {
+    let mut count = 0;
+    let page = doc.get_page(0).expect("get_page 0");
+    let Some(annots) = page.as_dict().and_then(|d| d.get("Annots")).and_then(|a| resolve(doc, a))
+    else {
+        return 0;
+    };
+    let Some(arr) = annots.as_array() else { return 0 };
+    for a in arr {
+        let Some(annot) = resolve(doc, a) else { continue };
+        let Some(ap) = annot.as_dict().and_then(|d| d.get("AP")).and_then(|x| resolve(doc, x))
+        else {
+            continue;
+        };
+        let Some(n) = ap.as_dict().and_then(|d| d.get("N")).and_then(|x| resolve(doc, x)) else {
+            continue;
+        };
+        // Walk the appearance form's resources for image XObjects.
+        let Some(res) = n.as_dict().and_then(|d| d.get("Resources")).and_then(|r| resolve(doc, r))
+        else {
+            continue;
+        };
+        if let Some(xo) = res.as_dict().and_then(|d| d.get("XObject")).and_then(|x| resolve(doc, x))
+        {
+            if let Some(xo_dict) = xo.as_dict() {
+                for v in xo_dict.values() {
+                    if let Some(obj) = resolve(doc, v) {
+                        let is_image = obj
+                            .as_dict()
+                            .and_then(|d| d.get("Subtype"))
+                            .and_then(|s| s.as_name())
+                            == Some("Image");
+                        if is_image {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn subset_preserves_signature_seal_but_drops_invalid_signature() {
+    let fixture = build_signed_fixture();
+
+    // Sanity: the fixture itself contains a /ByteRange signature dict.
+    assert!(
+        fixture.windows(b"/ByteRange".len()).any(|w| w == b"/ByteRange"),
+        "fixture should contain a signature"
+    );
+
+    // Subset the parsed fixture directly (no editor round-trip) to isolate.
+    let doc = PdfDocument::from_bytes(fixture).expect("parse fixture");
+    let (subset, report) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], SubsetOptions::default())
+            .expect("subset signed page");
+
+    let out = PdfDocument::from_bytes(subset.clone()).expect("subset parses");
+
+    // Text + the bound seal image survive.
+    assert!(out.extract_text(0).unwrap().contains("Signed Page"), "page text preserved");
+    assert_eq!(seal_image_count(&out), 1, "the seal image is preserved (and not duplicated)");
+
+    // Nothing claims to be a valid signature any more.
+    assert!(
+        !subset.windows(b"/ByteRange".len()).any(|w| w == b"/ByteRange"),
+        "no /ByteRange signature dict survives a rebuild"
+    );
+    assert!(
+        !subset.windows(b"/Sig".len()).any(|w| w == b"/Sig"),
+        "no leftover signature dictionary"
+    );
+    assert_eq!(report.dropped_signatures, 1, "one signature was dropped");
+    assert!(!report.warnings.is_empty(), "a warning was recorded");
+}
+
+#[test]
+fn subset_refuses_signed_page_when_policy_is_refuse() {
+    let fixture = build_signed_fixture();
+    let mut editor = DocumentEditor::from_bytes(fixture).expect("open editor");
+    let opts = SubsetOptions {
+        dedup: true,
+        on_signature: SignaturePolicy::Refuse,
+    };
+    let result = editor.subset_pages_with_options(&[0], opts);
+    assert!(result.is_err(), "Refuse policy must reject subsetting a signed page");
+
+    // The unsigned page (1) is fine under Refuse.
+    let mut editor2 =
+        DocumentEditor::from_bytes(build_signed_fixture()).expect("open editor 2");
+    let opts2 = SubsetOptions {
+        dedup: true,
+        on_signature: SignaturePolicy::Refuse,
+    };
+    let ok = editor2.subset_pages_with_options(&[1], opts2);
+    assert!(ok.is_ok(), "an unsigned page can still be subset under Refuse");
+}
