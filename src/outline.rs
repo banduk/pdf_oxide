@@ -292,7 +292,9 @@ fn deref_obj(
 /// A name-tree / `/Dests` value is either the destination **array**
 /// directly, or a dictionary with a `/D` entry holding it
 /// (ISO 32000-1 §12.3.2.3). Normalise to the array object.
-fn normalize_dest_value(
+///
+/// Shared with `editor::subset`, which remaps destinations onto kept pages.
+pub(crate) fn normalize_dest_value(
     v: &Object,
     resolve: &dyn Fn(crate::object::ObjectRef) -> Option<Object>,
 ) -> Option<Object> {
@@ -388,7 +390,10 @@ fn walk_name_tree(
 /// `/Dests` dictionary (PDF 1.1) then the `/Names` → `/Dests` name
 /// tree (PDF 1.2+). Pure given `resolve`; bounded; returns the
 /// normalised destination array object, or `None`.
-fn lookup_named_dest(
+///
+/// Shared with `editor::subset` so named-destination resolution lives in one
+/// place (ISO 32000-1 §12.3.2.3 / §7.9.6).
+pub(crate) fn lookup_named_dest(
     catalog: &std::collections::HashMap<String, Object>,
     target: &[u8],
     resolve: &dyn Fn(crate::object::ObjectRef) -> Option<Object>,
