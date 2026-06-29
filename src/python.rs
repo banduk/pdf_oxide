@@ -2814,6 +2814,34 @@ impl PyPdfDocument {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    /// Build a new PDF from only the listed pages, copying just what those pages
+    /// need to preserve their visual + semantic meaning — no orphan objects, and
+    /// duplicate objects (a font/image shared across pages) collapsed to one.
+    /// Internal links and bookmarks are remapped to the kept pages; a digital
+    /// signature's seal appearance is preserved while its (now-invalid) value is
+    /// dropped. Pages are 0-based and kept in the order given.
+    ///
+    /// # Example
+    ///
+    /// ```python
+    /// doc = PdfDocument.from_bytes(pdf_bytes)
+    /// just_three = doc.subset_pages([0, 4, 9])
+    /// ```
+    fn subset_pages<'py>(
+        &mut self,
+        py: Python<'py>,
+        pages: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        self.ensure_editor()?;
+        let editor = self.editor.as_mut().ok_or_else(|| {
+            PyRuntimeError::new_err("Internal error: editor missing after initialization")
+        })?;
+        let bytes = editor
+            .subset_pages(&pages)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// Extract several non-overlapping page ranges in one call. Each range is
     /// `(start, end)` interpreted as `[start, end)`. Returns a list of `bytes`
     /// objects, one per range, in the same order.

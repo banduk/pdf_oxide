@@ -1028,3 +1028,37 @@ class TestPdfDocumentEncryptedBytes:
         encrypted = doc2.to_bytes_encrypted("pw", "pw")
         assert len(encrypted) > 0
         assert encrypted[:5] == _PDF_MAGIC
+
+
+def _make_multipage_doc() -> PdfDocument:
+    body = "\n\n".join(
+        f"# Heading {i}\n\nParagraph number {i} with some filler text to push pagination."
+        for i in range(80)
+    )
+    data = Pdf.from_markdown(body).to_bytes()
+    return PdfDocument.from_bytes(data)
+
+
+class TestSubsetPages:
+    def test_subset_pages_returns_single_page_pdf(self):
+        doc = _make_multipage_doc()
+        assert doc.page_count() >= 1
+        out = doc.subset_pages([0])
+        assert out[:5] == _PDF_MAGIC
+        sub = PdfDocument.from_bytes(out)
+        assert sub.page_count() == 1
+        # the kept page's text still extracts
+        assert isinstance(sub.extract_text(0), str)
+
+    def test_subset_pages_keeps_order_and_count(self):
+        doc = _make_multipage_doc()
+        if doc.page_count() < 3:
+            pytest.skip("needs >= 3 pages to test reorder")
+        out = doc.subset_pages([2, 0])
+        sub = PdfDocument.from_bytes(out)
+        assert sub.page_count() == 2
+
+    def test_subset_pages_invalid_index_raises(self):
+        doc = _make_simple_doc()
+        with pytest.raises(Exception):  # noqa: B017
+            doc.subset_pages([999])

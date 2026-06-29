@@ -912,6 +912,21 @@ uint8_t *document_editor_extract_pages_to_bytes(DocumentEditor *handle,
 
 #if !defined(PDF_OXIDE_TARGET_WASM32)
 /**
+ * Build a new in-memory PDF from only the listed pages, copying just what
+ * those pages need to preserve their visual + semantic meaning — no orphan
+ * objects, and duplicate objects (a font/image shared across pages) collapsed
+ * to one. `pages` is a C array of 0-based page indices; `count` is its length.
+ * See `pdf_oxide::editor::subset`.
+ */
+uint8_t *document_editor_subset_pages_to_bytes(DocumentEditor *handle,
+                                               const int32_t *pages,
+                                               uintptr_t count,
+                                               uintptr_t *out_len,
+                                               int32_t *error_code);
+#endif
+
+#if !defined(PDF_OXIDE_TARGET_WASM32)
+/**
  * Convert the edited document to PDF/A in-place.
  * level: 0=A1b 1=A1a 2=A2b 3=A2a 4=A2u 5=A3b 6=A3a 7=A3u
  */
