@@ -2870,39 +2870,17 @@ impl PyPdfDocument {
         keep_optional_content: bool,
         keep_catalog_metadata: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        use crate::editor::{ResourceTrim, SignaturePolicy, SubsetOptions};
-
-        let resources = match resources {
-            "wholesale" => ResourceTrim::Wholesale,
-            "page" => ResourceTrim::Page,
-            "forms" => ResourceTrim::Forms,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "resources must be 'wholesale', 'page', or 'forms' (got {other:?})"
-                )))
-            },
-        };
-        let on_signature = match on_signature {
-            "preserve_visual" => SignaturePolicy::PreserveVisual,
-            "drop" => SignaturePolicy::Drop,
-            "refuse" => SignaturePolicy::Refuse,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "on_signature must be 'preserve_visual', 'drop', or 'refuse' (got {other:?})"
-                )))
-            },
-        };
-        let opts = SubsetOptions {
+        let opts = build_subset_options(
             dedup,
-            on_signature,
             resources,
+            on_signature,
             keep_links,
             keep_outlines,
             keep_struct_tree,
             keep_acroform,
             keep_optional_content,
             keep_catalog_metadata,
-        };
+        )?;
 
         self.ensure_editor()?;
         let editor = self.editor.as_mut().ok_or_else(|| {
@@ -3545,6 +3523,147 @@ fn python_to_form_field_value(
         Ok(FormFieldValue::None)
     } else {
         Err(PyRuntimeError::new_err("Invalid value."))
+    }
+}
+
+/// Parse the string-valued subset options into a `SubsetOptions`. Shared by
+/// `PdfDocument.subset_pages` and `PdfRebuilder` so both accept the same knobs.
+#[allow(clippy::too_many_arguments)]
+fn build_subset_options(
+    dedup: bool,
+    resources: &str,
+    on_signature: &str,
+    keep_links: bool,
+    keep_outlines: bool,
+    keep_struct_tree: bool,
+    keep_acroform: bool,
+    keep_optional_content: bool,
+    keep_catalog_metadata: bool,
+) -> PyResult<crate::editor::SubsetOptions> {
+    use crate::editor::{ResourceTrim, SignaturePolicy, SubsetOptions};
+
+    let resources = match resources {
+        "wholesale" => ResourceTrim::Wholesale,
+        "page" => ResourceTrim::Page,
+        "forms" => ResourceTrim::Forms,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "resources must be 'wholesale', 'page', or 'forms' (got {other:?})"
+            )))
+        },
+    };
+    let on_signature = match on_signature {
+        "preserve_visual" => SignaturePolicy::PreserveVisual,
+        "drop" => SignaturePolicy::Drop,
+        "refuse" => SignaturePolicy::Refuse,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "on_signature must be 'preserve_visual', 'drop', or 'refuse' (got {other:?})"
+            )))
+        },
+    };
+    Ok(SubsetOptions {
+        dedup,
+        on_signature,
+        resources,
+        keep_links,
+        keep_outlines,
+        keep_struct_tree,
+        keep_acroform,
+        keep_optional_content,
+        keep_catalog_metadata,
+    })
+}
+
+/// Build a new PDF from pages drawn from one or more source documents, copying
+/// only what's needed and deduplicating shared objects — the multi-source
+/// counterpart of `PdfDocument.subset_pages`.
+///
+/// # Example
+///
+/// ```python
+/// rb = PdfRebuilder(resources="forms")
+/// a = rb.add_source(bytes_a)
+/// b = rb.add_source(bytes_b)
+/// rb.add_pages(a, [0, 1])   # pages 0 and 1 of the first doc
+/// rb.add_page(b, 3)         # then page 3 of the second
+/// merged = rb.build()       # -> bytes
+/// ```
+///
+/// Constructor options mirror `PdfDocument.subset_pages` (document-level
+/// outlines/tags are taken from the first source).
+#[pyclass(module = "pdf_oxide.pdf_oxide", name = "PdfRebuilder")]
+pub struct PyPdfRebuilder {
+    inner: crate::editor::PdfRebuilder,
+}
+
+#[pymethods]
+impl PyPdfRebuilder {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        *,
+        dedup = true,
+        resources = "forms",
+        on_signature = "preserve_visual",
+        keep_links = true,
+        keep_outlines = true,
+        keep_struct_tree = true,
+        keep_acroform = true,
+        keep_optional_content = true,
+        keep_catalog_metadata = true,
+    ))]
+    fn new(
+        dedup: bool,
+        resources: &str,
+        on_signature: &str,
+        keep_links: bool,
+        keep_outlines: bool,
+        keep_struct_tree: bool,
+        keep_acroform: bool,
+        keep_optional_content: bool,
+        keep_catalog_metadata: bool,
+    ) -> PyResult<Self> {
+        let opts = build_subset_options(
+            dedup,
+            resources,
+            on_signature,
+            keep_links,
+            keep_outlines,
+            keep_struct_tree,
+            keep_acroform,
+            keep_optional_content,
+            keep_catalog_metadata,
+        )?;
+        Ok(Self {
+            inner: crate::editor::PdfRebuilder::new().with_options(opts),
+        })
+    }
+
+    /// Add a source PDF (bytes); returns its 0-based source index.
+    fn add_source(&mut self, data: Vec<u8>) -> PyResult<usize> {
+        self.inner
+            .add_source(data)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Append one page (0-based) from a previously-added source.
+    fn add_page(&mut self, source: usize, page: usize) {
+        self.inner.add_page(source, page);
+    }
+
+    /// Append several pages (0-based, in order) from a previously-added source.
+    fn add_pages(&mut self, source: usize, pages: Vec<usize>) {
+        self.inner.add_pages(source, &pages);
+    }
+
+    /// Build the merged PDF and return its bytes.
+    fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let (bytes, _report) = self
+            .inner
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyBytes::new(py, &bytes))
     }
 }
 
@@ -8021,6 +8140,7 @@ fn pdf_oxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPdfDocument>()?;
     m.add_class::<PyPageCount>()?;
     m.add_class::<PyPdf>()?;
+    m.add_class::<PyPdfRebuilder>()?;
     m.add_class::<PyPdfPage>()?;
     m.add_class::<PyPdfText>()?;
     m.add_class::<PyPdfTextId>()?;
