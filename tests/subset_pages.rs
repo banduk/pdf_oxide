@@ -688,3 +688,125 @@ fn subset_trims_form_internal_resources() {
     let out2 = PdfDocument::from_bytes(whole).expect("parse whole");
     assert_eq!(form_internal_image_count(&out2), 2, "wholesale form keeps both images");
 }
+
+/// Build a 2-page tagged PDF: a /Document structure element with one /P
+/// (paragraph) per page, marked content (MCID 0) on each page, a ParentTree,
+/// and per-page /StructParents.
+fn build_tagged_fixture() -> Vec<u8> {
+    fn stream_obj(data: &[u8]) -> Vec<u8> {
+        let mut v = format!("<< /Length {} >>\nstream\n", data.len()).into_bytes();
+        v.extend_from_slice(data);
+        v.extend_from_slice(b"\nendstream");
+        v
+    }
+    let c0 = b"/P <</MCID 0>> BDC BT /F1 12 Tf 20 100 Td (Page0) Tj ET EMC".to_vec();
+    let c1 = b"/P <</MCID 0>> BDC BT /F1 12 Tf 20 100 Td (Page1) Tj ET EMC".to_vec();
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 30 0 R /MarkInfo << /Marked true >> >>"
+                .to_vec(),
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 200 200] \
+              /Resources << /Font << /F1 10 0 R >> >> >>"
+                .to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /StructParents 0 >>".to_vec()),
+        (4, stream_obj(&c0)),
+        (5, b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /StructParents 1 >>".to_vec()),
+        (6, stream_obj(&c1)),
+        (10, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (
+            30,
+            b"<< /Type /StructTreeRoot /K 31 0 R /ParentTree 40 0 R /ParentTreeNextKey 2 \
+              /RoleMap << >> >>"
+                .to_vec(),
+        ),
+        (31, b"<< /Type /StructElem /S /Document /P 30 0 R /K [32 0 R 33 0 R] >>".to_vec()),
+        (32, b"<< /Type /StructElem /S /P /P 31 0 R /Pg 3 0 R /K 0 >>".to_vec()),
+        (33, b"<< /Type /StructElem /S /P /P 31 0 R /Pg 5 0 R /K 0 >>".to_vec()),
+        (40, b"<< /Nums [0 [32 0 R] 1 [33 0 R]] >>".to_vec()),
+    ];
+    let ids: Vec<u32> = objects.iter().map(|(id, _)| *id).collect();
+    let max_id = *ids.iter().max().unwrap() as usize;
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = vec![0usize; max_id + 1];
+    for (id, body) in &objects {
+        offsets[*id as usize] = out.len();
+        out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \r\n");
+    for id in 1..=max_id {
+        if ids.contains(&(id as u32)) {
+            out.extend_from_slice(format!("{:010} 00000 n \r\n", offsets[id]).as_bytes());
+        } else {
+            out.extend_from_slice(b"0000000000 00000 f \r\n");
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            max_id + 1,
+            xref_start
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn subset_prunes_structure_tree_to_kept_pages() {
+    let fixture = build_tagged_fixture();
+    let doc = PdfDocument::from_bytes(fixture).expect("parse");
+
+    // Keep page 0 only; the /P element for page 1 must be pruned.
+    let (subset, report) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0)], SubsetOptions::default())
+            .expect("subset");
+    let out = PdfDocument::from_bytes(subset).expect("subset parses");
+
+    // Document + one surviving /P.
+    assert_eq!(report.struct_elements, 2, "Document + the kept page's P survive (P for page 1 pruned)");
+
+    let cat = out.catalog().unwrap();
+    let cat_d = cat.as_dict().unwrap();
+    assert!(cat_d.contains_key("MarkInfo"), "MarkInfo present");
+    let st = cat_d.get("StructTreeRoot").and_then(|s| resolve(&out, s)).expect("StructTreeRoot");
+    let st_d = st.as_dict().unwrap();
+    assert_eq!(st_d.get("Type").and_then(|t| t.as_name()), Some("StructTreeRoot"));
+
+    // Root /K -> Document element.
+    let docel = st_d.get("K").and_then(|k| resolve(&out, k)).expect("doc elem");
+    let docel_d = docel.as_dict().unwrap();
+    assert_eq!(docel_d.get("S").and_then(|s| s.as_name()), Some("Document"));
+
+    // Document has exactly one surviving child P, pointing at a real kept page.
+    let children: Vec<pdf_oxide::object::Object> = match docel_d.get("K") {
+        Some(pdf_oxide::object::Object::Array(a)) => a.clone(),
+        Some(other) => vec![other.clone()],
+        None => vec![],
+    };
+    assert_eq!(children.len(), 1, "only the kept page's paragraph remains");
+    let p = resolve(&out, &children[0]).unwrap();
+    let p_d = p.as_dict().unwrap();
+    assert_eq!(p_d.get("S").and_then(|s| s.as_name()), Some("P"));
+    let pg = p_d.get("Pg").and_then(|g| resolve(&out, g)).unwrap();
+    assert_eq!(pg.as_dict().and_then(|d| d.get("Type")).and_then(|t| t.as_name()), Some("Page"));
+
+    // ParentTree maps the kept page's StructParents key to the P element.
+    let pt = st_d.get("ParentTree").and_then(|p| resolve(&out, p)).expect("ParentTree");
+    let nums = pt.as_dict().and_then(|d| d.get("Nums")).and_then(|n| n.as_array()).expect("Nums");
+    assert!(nums.len() >= 2, "at least one (key, array) pair");
+    let arr = resolve(&out, &nums[1]).unwrap();
+    let first = arr.as_array().and_then(|a| a.first()).and_then(|e| resolve(&out, e)).unwrap();
+    assert_eq!(first.as_dict().and_then(|d| d.get("S")).and_then(|s| s.as_name()), Some("P"));
+
+    // Text still extracts.
+    assert!(out.extract_text(0).unwrap().contains("Page0"));
+}
