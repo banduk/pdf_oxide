@@ -51,6 +51,7 @@ use crate::document::PdfDocument;
 use crate::error::{Error, Result};
 use crate::object::{Object, ObjectRef};
 
+mod acroform;
 mod dedup;
 mod dests;
 mod outlines;
@@ -91,6 +92,16 @@ pub struct SubsetOptions {
     /// Recurse into Form XObjects and trim their `/Resources` too (otherwise a
     /// used form is copied wholesale).
     pub trim_forms: bool,
+    /// Keep interactive form fields (`/AcroForm`) whose widgets land on kept
+    /// pages, with the `/Fields` tree pruned + relinked. When off, widget
+    /// appearances are still kept but the form becomes non-interactive.
+    pub keep_acroform: bool,
+    /// Keep optional-content layers (`/OCProperties`) so `/OC`-marked content
+    /// keeps its layer definitions + default visibility.
+    pub keep_optional_content: bool,
+    /// Carry position-independent catalog metadata (`/Lang`, `/Metadata`,
+    /// `/ViewerPreferences`, `/PageMode`, `/PageLayout`).
+    pub keep_catalog_metadata: bool,
 }
 
 impl Default for SubsetOptions {
@@ -102,6 +113,9 @@ impl Default for SubsetOptions {
             keep_outlines: true,
             keep_struct_tree: true,
             trim_forms: true,
+            keep_acroform: true,
+            keep_optional_content: true,
+            keep_catalog_metadata: true,
         }
     }
 }
@@ -123,6 +137,8 @@ pub struct SubsetReport {
     pub links_severed: usize,
     /// Structure elements kept after pruning the tag tree.
     pub struct_elements: usize,
+    /// Interactive form fields kept (their widgets land on kept pages).
+    pub form_fields: usize,
 }
 
 /// The deep-copy / trim / dedup engine. Methods are implemented across the
@@ -151,6 +167,12 @@ pub(super) struct Builder<'a> {
     /// (source index, source form-xobject id) -> new id of its *trimmed* copy,
     /// so a form used by several pages is trimmed + emitted once.
     form_trim_map: HashMap<(usize, u32), u32>,
+    /// (source index, source AcroForm field id) -> new field id.
+    field_map: HashMap<(usize, u32), u32>,
+    /// new field id -> child new ids (widgets / sub-fields) for rebuilding /Kids.
+    field_kids: HashMap<u32, Vec<u32>>,
+    /// new ids of top-level form fields (no parent), in discovery order.
+    top_fields: Vec<u32>,
 }
 
 impl<'a> Builder<'a> {
@@ -167,6 +189,9 @@ impl<'a> Builder<'a> {
             page_ids: Vec::new(),
             page_id_map: HashMap::new(),
             form_trim_map: HashMap::new(),
+            field_map: HashMap::new(),
+            field_kids: HashMap::new(),
+            top_fields: Vec::new(),
         }
     }
 
@@ -269,6 +294,26 @@ impl<'a> Builder<'a> {
         self.sources[src].load_object(root).ok()?.as_dict().cloned()
     }
 
+    /// Carry a catalog entry (e.g. `/OCProperties`, `/Metadata`) into the new
+    /// document as a pinned object; returns its new id. Pinning keeps dedup from
+    /// collapsing it, and storing it in `objects` before dedup keeps its
+    /// internal references correctly rewritten.
+    fn carry_catalog_ref(&mut self, src: usize, key: &str) -> Option<u32> {
+        let val = self.source_catalog(src)?.get(key)?.clone();
+        match self.remap(src, &val, 1) {
+            Object::Reference(r) => {
+                self.pinned.insert(r.id);
+                Some(r.id)
+            },
+            other => {
+                let id = self.alloc();
+                self.pinned.insert(id);
+                self.objects.insert(id, other);
+                Some(id)
+            },
+        }
+    }
+
     /// Finalize: build the page tree + catalog, compact ids, and serialize.
     fn finish(mut self) -> Result<(Vec<u8>, SubsetReport)> {
         let info_id = self.import_info(0);
@@ -283,6 +328,32 @@ impl<'a> Builder<'a> {
             self.build_struct_tree(0)
         } else {
             None
+        };
+        // Interactive forms + layers + position-independent catalog metadata.
+        // Built before dedup so their references are rewritten consistently.
+        let acroform_id = if self.opts.keep_acroform {
+            self.build_acroform(0)
+        } else {
+            None
+        };
+        let oc_id = if self.opts.keep_optional_content {
+            self.carry_catalog_ref(0, "OCProperties")
+        } else {
+            None
+        };
+        let meta: Vec<(&str, u32)> = if self.opts.keep_catalog_metadata {
+            [
+                "Lang",
+                "Metadata",
+                "ViewerPreferences",
+                "PageMode",
+                "PageLayout",
+            ]
+            .into_iter()
+            .filter_map(|k| self.carry_catalog_ref(0, k).map(|id| (k, id)))
+            .collect()
+        } else {
+            Vec::new()
         };
 
         if self.opts.dedup {
@@ -324,6 +395,15 @@ impl<'a> Builder<'a> {
             let mut mark = HashMap::new();
             mark.insert("Marked".to_string(), Object::Boolean(true));
             catalog.insert("MarkInfo".to_string(), Object::Dictionary(mark));
+        }
+        if let Some(aid) = acroform_id {
+            catalog.insert("AcroForm".to_string(), Object::Reference(ObjectRef::new(aid, 0)));
+        }
+        if let Some(oid) = oc_id {
+            catalog.insert("OCProperties".to_string(), Object::Reference(ObjectRef::new(oid, 0)));
+        }
+        for (k, id) in meta {
+            catalog.insert(k.to_string(), Object::Reference(ObjectRef::new(id, 0)));
         }
         self.objects.insert(catalog_id, Object::Dictionary(catalog));
 

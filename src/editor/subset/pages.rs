@@ -121,7 +121,7 @@ impl Builder<'_> {
         // dropped page back in via a raw /Dest or /A.
         let orig_dest = annot.remove("Dest");
         let orig_action = annot.remove("A");
-        annot.remove("Parent");
+        let orig_parent = annot.remove("Parent").and_then(|p| p.as_reference());
         annot.remove("P");
 
         // Resolve navigation against the (now complete) page-id map.
@@ -141,6 +141,7 @@ impl Builder<'_> {
             self.report.links_severed += 1;
         }
 
+        let mut is_signature = false;
         if self.is_signature_widget(src, &annot) {
             match self.opts.on_signature {
                 SignaturePolicy::Refuse => {
@@ -155,6 +156,7 @@ impl Builder<'_> {
                     for k in ["V", "FT", "T", "TU", "Ff", "DV", "Lock", "SV", "DA", "DR"] {
                         annot.remove(k);
                     }
+                    is_signature = true;
                     self.report.dropped_signatures += 1;
                     self.report.warnings.push(format!(
                         "page {page_index}: digital signature dropped (rebuild invalidates it); \
@@ -175,6 +177,21 @@ impl Builder<'_> {
         }
         let aid = self.alloc();
         self.objects.insert(aid, Object::Dictionary(remapped));
+
+        // Reconnect interactive form-field widgets to a rebuilt /AcroForm tree.
+        // A dropped signature is never re-registered as a field.
+        let is_field = !is_signature
+            && self.opts.keep_acroform
+            && (annot.contains_key("FT") || orig_parent.is_some());
+        if is_field {
+            // Pin so two distinct fields can't be merged by dedup.
+            self.pinned.insert(aid);
+            if let Some(pfid) = self.register_form_widget(src, &annot, aid, orig_parent) {
+                if let Some(Object::Dictionary(d)) = self.objects.get_mut(&aid) {
+                    d.insert("Parent".to_string(), Object::Reference(ObjectRef::new(pfid, 0)));
+                }
+            }
+        }
         Ok(Some(Object::Reference(ObjectRef::new(aid, 0))))
     }
 }
