@@ -787,9 +787,26 @@ impl<'a> Builder<'a> {
 
     /// Collapse byte-identical objects to a single id, remapping references,
     /// iterating to a fixpoint (so collapsing children can collapse parents).
+    ///
+    /// Canonical bytes are cached per object and only recomputed for objects
+    /// whose references actually changed in the previous round, so big immutable
+    /// streams (images/fonts) are serialized once, not once per round. Buckets
+    /// are keyed by a fast hash and confirmed with a full-bytes comparison, so a
+    /// hash collision can never merge two genuinely different objects.
     fn dedup(&mut self) {
+        let mut canon: HashMap<u32, Vec<u8>> = HashMap::with_capacity(self.objects.len());
+        let mut dirty: HashSet<u32> = self.objects.keys().copied().collect();
+
         loop {
-            let mut by_hash: HashMap<Vec<u8>, u32> = HashMap::new();
+            for &id in &dirty {
+                if let Some(obj) = self.objects.get(&id) {
+                    canon.insert(id, canonical_bytes(obj));
+                }
+            }
+            dirty.clear();
+
+            // hash -> candidate canonical ids sharing that hash.
+            let mut buckets: HashMap<u64, Vec<u32>> = HashMap::new();
             let mut remap: HashMap<u32, u32> = HashMap::new();
             let mut ids: Vec<u32> = self.objects.keys().copied().collect();
             ids.sort_unstable();
@@ -797,14 +814,21 @@ impl<'a> Builder<'a> {
                 if self.pinned.contains(&id) {
                     continue;
                 }
-                let key = canonical_bytes(&self.objects[&id]);
-                match by_hash.get(&key) {
-                    Some(&canon) => {
-                        remap.insert(id, canon);
+                let bytes = &canon[&id];
+                let h = fnv1a(bytes);
+                let bucket = buckets.entry(h).or_default();
+                let mut matched = None;
+                for &cid in bucket.iter() {
+                    if canon[&cid] == *bytes {
+                        matched = Some(cid);
+                        break;
+                    }
+                }
+                match matched {
+                    Some(cid) => {
+                        remap.insert(id, cid);
                     },
-                    None => {
-                        by_hash.insert(key, id);
-                    },
+                    None => bucket.push(id),
                 }
             }
             if remap.is_empty() {
@@ -813,9 +837,14 @@ impl<'a> Builder<'a> {
             self.report.objects_deduped += remap.len();
             for id in remap.keys() {
                 self.objects.remove(id);
+                canon.remove(id);
             }
-            for obj in self.objects.values_mut() {
-                rewrite_refs(obj, &remap);
+            // Rewrite references; only objects that actually changed need their
+            // canonical bytes recomputed next round.
+            for (&id, obj) in self.objects.iter_mut() {
+                if rewrite_refs(obj, &remap) {
+                    dirty.insert(id);
+                }
             }
             self.page_ids.retain(|id| !remap.contains_key(id));
         }
@@ -938,19 +967,35 @@ fn canon_dict(d: &HashMap<String, Object>, out: &mut Vec<u8>) {
     out.extend_from_slice(b">>");
 }
 
-/// Rewrite references via `map` (id -> canonical id) in place.
-fn rewrite_refs(obj: &mut Object, map: &HashMap<u32, u32>) {
+/// Rewrite references via `map` (id -> canonical id) in place. Returns true if
+/// any reference was changed.
+fn rewrite_refs(obj: &mut Object, map: &HashMap<u32, u32>) -> bool {
     match obj {
-        Object::Reference(r) => {
-            if let Some(&canon) = map.get(&r.id) {
+        Object::Reference(r) => match map.get(&r.id) {
+            Some(&canon) => {
                 r.id = canon;
-            }
+                true
+            },
+            None => false,
         },
-        Object::Array(a) => a.iter_mut().for_each(|o| rewrite_refs(o, map)),
-        Object::Dictionary(d) => d.values_mut().for_each(|o| rewrite_refs(o, map)),
-        Object::Stream { dict, .. } => dict.values_mut().for_each(|o| rewrite_refs(o, map)),
-        _ => {},
+        Object::Array(a) => a.iter_mut().fold(false, |acc, o| rewrite_refs(o, map) | acc),
+        Object::Dictionary(d) => d.values_mut().fold(false, |acc, o| rewrite_refs(o, map) | acc),
+        Object::Stream { dict, .. } => {
+            dict.values_mut().fold(false, |acc, o| rewrite_refs(o, map) | acc)
+        },
+        _ => false,
     }
+}
+
+/// FNV-1a 64-bit hash — fast, dependency-free; used only as a bucketing key
+/// (full-bytes equality still confirms a match, so collisions are harmless).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Like [`rewrite_refs`] but for the final id compaction (every ref must map).
