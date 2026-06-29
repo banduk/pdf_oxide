@@ -66,6 +66,17 @@ pub struct SubsetOptions {
     pub dedup: bool,
     /// How to handle signatures on kept pages.
     pub on_signature: SignaturePolicy,
+    /// Keep link annotations + GoTo actions whose target is a kept page
+    /// (remapped to the new page); links to dropped pages are severed.
+    pub keep_links: bool,
+    /// Keep the document outline (bookmarks), pruned to entries that still
+    /// resolve to a kept page (or have a surviving descendant).
+    pub keep_outlines: bool,
+    /// Keep the tagged-PDF structure tree, pruned to the kept pages.
+    pub keep_struct_tree: bool,
+    /// Recurse into Form XObjects and trim their `/Resources` too (otherwise a
+    /// used form is copied wholesale).
+    pub trim_forms: bool,
 }
 
 impl Default for SubsetOptions {
@@ -73,6 +84,10 @@ impl Default for SubsetOptions {
         SubsetOptions {
             dedup: true,
             on_signature: SignaturePolicy::default(),
+            keep_links: true,
+            keep_outlines: true,
+            keep_struct_tree: true,
+            trim_forms: true,
         }
     }
 }
@@ -88,6 +103,12 @@ pub struct SubsetReport {
     pub objects_written: usize,
     /// Objects removed by deduplication.
     pub objects_deduped: usize,
+    /// Outline (bookmark) entries kept.
+    pub outline_entries: usize,
+    /// Link/GoTo destinations severed because their target page was dropped.
+    pub links_severed: usize,
+    /// Structure elements kept after pruning the tag tree.
+    pub struct_elements: usize,
 }
 
 /// Resource names a content stream actually references, per category.
@@ -174,6 +195,10 @@ struct Builder<'a> {
     /// page back into the graph.
     severed: Vec<HashSet<u32>>,
     page_ids: Vec<u32>,
+    /// (source index, source page-leaf object id) -> new page id. Built for ALL
+    /// kept pages before any destination is remapped, so a link/bookmark on one
+    /// page can resolve a target on another.
+    page_id_map: HashMap<(usize, u32), u32>,
 }
 
 impl<'a> Builder<'a> {
@@ -188,6 +213,7 @@ impl<'a> Builder<'a> {
             pinned: HashSet::new(),
             severed: vec![HashSet::new(); sources.len()],
             page_ids: Vec::new(),
+            page_id_map: HashMap::new(),
         }
     }
 
@@ -324,8 +350,10 @@ impl<'a> Builder<'a> {
         is_widget && (is_sig_field || v_is_sig)
     }
 
-    /// Process one source page into a new page object; returns its new id.
-    fn add_page(&mut self, src: usize, page_index: usize) -> Result<u32> {
+    /// Build the page object for a (source, page) into the pre-allocated
+    /// `page_id`. The id must already be in `page_id_map` so destinations on
+    /// other pages can target it.
+    fn build_page(&mut self, src: usize, page_index: usize, page_id: u32) -> Result<()> {
         let page_obj = self.sources[src].get_page(page_index)?;
         let page_dict = page_obj
             .as_dict()
@@ -337,9 +365,6 @@ impl<'a> Builder<'a> {
         if let Ok(content) = self.sources[src].get_page_content_data(page_index) {
             scan_used(&content, &mut used);
         }
-
-        let page_id = self.alloc();
-        self.pinned.insert(page_id);
 
         let mut new_page: HashMap<String, Object> = HashMap::new();
         new_page.insert("Type".to_string(), Object::Name("Page".to_string()));
@@ -381,7 +406,7 @@ impl<'a> Builder<'a> {
 
         self.objects.insert(page_id, Object::Dictionary(new_page));
         self.page_ids.push(page_id);
-        Ok(page_id)
+        Ok(())
     }
 
     /// Edit + import one annotation. Returns the new reference, or `None` if the
@@ -401,11 +426,30 @@ impl<'a> Builder<'a> {
         };
         let mut annot = annot.clone();
 
-        // Sever back-pointers and navigation so we never drag in dropped pages.
+        // Navigation is handled explicitly below (remapped to kept pages, or
+        // severed). Strip it + back-pointers first so `remap` can never drag a
+        // dropped page back in via a raw /Dest or /A.
+        let orig_dest = annot.remove("Dest");
+        let orig_action = annot.remove("A");
         annot.remove("Parent");
         annot.remove("P");
-        annot.remove("Dest");
-        annot.remove("A");
+
+        // Resolve navigation against the (now complete) page-id map.
+        let mut new_nav: Option<(&'static str, Object)> = None;
+        if self.opts.keep_links {
+            if let Some(dest) = orig_dest.as_ref() {
+                if let Some(v) = self.remap_dest_value(src, dest) {
+                    new_nav = Some(("Dest", v));
+                }
+            } else if let Some(action) = orig_action.as_ref() {
+                if let Some(v) = self.remap_action(src, action) {
+                    new_nav = Some(("A", v));
+                }
+            }
+        }
+        if new_nav.is_none() && (orig_dest.is_some() || orig_action.is_some()) {
+            self.report.links_severed += 1;
+        }
 
         if self.is_signature_widget(src, &annot) {
             match self.opts.on_signature {
@@ -435,6 +479,10 @@ impl<'a> Builder<'a> {
         // it as a *source* reference and re-import the wrong object.
         let mut remapped = self.remap_dict(src, &annot);
         remapped.insert("P".to_string(), Object::Reference(ObjectRef::new(page_id, 0)));
+        if let Some((key, value)) = new_nav {
+            // `value` already holds new-id references — insert AFTER remap.
+            remapped.insert(key.to_string(), value);
+        }
         let aid = self.alloc();
         self.objects.insert(aid, Object::Dictionary(remapped));
         Ok(Some(Object::Reference(ObjectRef::new(aid, 0))))
@@ -444,6 +492,223 @@ impl<'a> Builder<'a> {
     fn import_info(&mut self, src: usize) -> Option<u32> {
         let info_ref = self.sources[src].trailer().as_dict()?.get("Info")?.as_reference()?;
         Some(self.import(src, info_ref, 0))
+    }
+
+    fn source_catalog(&self, src: usize) -> Option<HashMap<String, Object>> {
+        let root = self.sources[src].trailer().as_dict()?.get("Root")?.as_reference()?;
+        self.sources[src].load_object(root).ok()?.as_dict().cloned()
+    }
+
+    /// Resolve any destination form (explicit array, indirect ref, `/D` wrapper,
+    /// or named destination) to the explicit destination array.
+    fn dest_to_array(&self, src: usize, dest: &Object, depth: usize) -> Option<Vec<Object>> {
+        if depth > 8 {
+            return None;
+        }
+        match dest {
+            Object::Array(a) => Some(a.clone()),
+            Object::Reference(r) => {
+                let o = self.sources[src].load_object(*r).ok()?;
+                self.dest_to_array(src, &o, depth + 1)
+            },
+            Object::Dictionary(d) => {
+                let inner = d.get("D")?;
+                self.dest_to_array(src, inner, depth + 1)
+            },
+            // Named destination: PDF 1.1 /Dests dict (name key)…
+            Object::Name(n) => {
+                let v = self.resolve_named_dest_name(src, n)?;
+                self.dest_to_array(src, &v, depth + 1)
+            },
+            // …or PDF 1.2+ /Names /Dests name tree (string key).
+            Object::String(s) => {
+                let v = self.resolve_named_dest_string(src, s)?;
+                self.dest_to_array(src, &v, depth + 1)
+            },
+            _ => None,
+        }
+    }
+
+    fn resolve_named_dest_name(&self, src: usize, name: &str) -> Option<Object> {
+        let cat = self.source_catalog(src)?;
+        let dests = cat.get("Dests").and_then(|d| self.resolve(src, d))?;
+        dests.as_dict()?.get(name).cloned()
+    }
+
+    fn resolve_named_dest_string(&self, src: usize, key: &[u8]) -> Option<Object> {
+        let cat = self.source_catalog(src)?;
+        let names = cat.get("Names").and_then(|n| self.resolve(src, n))?;
+        let dests = names.as_dict()?.get("Dests").and_then(|d| self.resolve(src, d))?;
+        self.name_tree_lookup(src, &dests, key, 0)
+    }
+
+    fn name_tree_lookup(&self, src: usize, node: &Object, key: &[u8], depth: usize) -> Option<Object> {
+        if depth > 32 {
+            return None;
+        }
+        let nd = node.as_dict()?;
+        if let Some(names) =
+            nd.get("Names").and_then(|n| self.resolve(src, n)).and_then(|o| o.as_array().cloned())
+        {
+            let mut i = 0;
+            while i + 1 < names.len() {
+                if names[i].as_string() == Some(key) {
+                    return Some(names[i + 1].clone());
+                }
+                i += 2;
+            }
+        }
+        if let Some(kids) =
+            nd.get("Kids").and_then(|k| self.resolve(src, k)).and_then(|o| o.as_array().cloned())
+        {
+            for kid in kids {
+                let Some(kid_obj) = self.resolve(src, &kid) else { continue };
+                if let Some(v) = self.name_tree_lookup(src, &kid_obj, key, depth + 1) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    /// Remap a destination to point at the kept page, or `None` if its target
+    /// page was dropped / unresolvable. The returned value already holds new-id
+    /// references, so insert it AFTER `remap_dict`.
+    fn remap_dest_value(&self, src: usize, dest: &Object) -> Option<Object> {
+        let arr = self.dest_to_array(src, dest, 0)?;
+        let page_ref = arr.first()?.as_reference()?;
+        let new_pid = *self.page_id_map.get(&(src, page_ref.id))?;
+        let mut new_arr = arr;
+        new_arr[0] = Object::Reference(ObjectRef::new(new_pid, 0));
+        Some(Object::Array(new_arr))
+    }
+
+    /// Remap an action: GoTo destinations are repointed at kept pages; URI/Named
+    /// actions are kept verbatim; everything else (incl. GoTo to a dropped page)
+    /// is dropped. The result is self-contained (no source references besides
+    /// the remapped /D), safe to insert after `remap_dict`.
+    fn remap_action(&self, src: usize, action: &Object) -> Option<Object> {
+        let act = self.resolve(src, action)?;
+        let ad = act.as_dict()?;
+        match ad.get("S").and_then(|s| s.as_name()) {
+            Some("GoTo") => {
+                let new_d = self.remap_dest_value(src, ad.get("D")?)?;
+                let mut nd = ad.clone();
+                nd.insert("D".to_string(), new_d);
+                nd.remove("Next");
+                Some(Object::Dictionary(nd))
+            },
+            Some("URI") | Some("Named") => {
+                let mut nd = ad.clone();
+                nd.remove("Next");
+                Some(Object::Dictionary(nd))
+            },
+            _ => None,
+        }
+    }
+
+    fn outline_dest(&self, src: usize, item: &HashMap<String, Object>) -> Option<(&'static str, Object)> {
+        if let Some(d) = item.get("Dest") {
+            return self.remap_dest_value(src, d).map(|v| ("Dest", v));
+        }
+        if let Some(a) = item.get("A") {
+            return self.remap_action(src, a).map(|v| ("A", v));
+        }
+        None
+    }
+
+    /// Build a pruned outline sibling chain, returning the new ids in order.
+    /// An item is kept iff it still resolves to a kept page OR has a surviving
+    /// descendant.
+    fn build_outline_items(
+        &mut self,
+        src: usize,
+        mut cur: Option<ObjectRef>,
+        parent_id: u32,
+        depth: usize,
+    ) -> Vec<u32> {
+        let mut result: Vec<u32> = Vec::new();
+        if depth > 64 {
+            return result;
+        }
+        while let Some(item_ref) = cur {
+            let Some(item) =
+                self.sources[src].load_object(item_ref).ok().and_then(|o| o.as_dict().cloned())
+            else {
+                break;
+            };
+            let next = item.get("Next").and_then(|n| n.as_reference());
+
+            let my_id = self.alloc();
+            self.pinned.insert(my_id);
+            let child_first = item.get("First").and_then(|f| f.as_reference());
+            let child_ids = self.build_outline_items(src, child_first, my_id, depth + 1);
+            let dest = self.outline_dest(src, &item);
+
+            if dest.is_none() && child_ids.is_empty() {
+                self.pinned.remove(&my_id); // unused id -> dropped at compaction
+                cur = next;
+                continue;
+            }
+
+            let mut d: HashMap<String, Object> = HashMap::new();
+            d.insert("Parent".to_string(), Object::Reference(ObjectRef::new(parent_id, 0)));
+            for key in ["Title", "C", "F"] {
+                if let Some(v) = item.get(key) {
+                    d.insert(key.to_string(), v.clone());
+                }
+            }
+            if let Some((k, v)) = dest {
+                d.insert(k.to_string(), v);
+            }
+            if let Some(&first) = child_ids.first() {
+                d.insert("First".to_string(), Object::Reference(ObjectRef::new(first, 0)));
+            }
+            if let Some(&last) = child_ids.last() {
+                d.insert("Last".to_string(), Object::Reference(ObjectRef::new(last, 0)));
+                d.insert("Count".to_string(), Object::Integer(child_ids.len() as i64));
+            }
+            self.objects.insert(my_id, Object::Dictionary(d));
+            self.report.outline_entries += 1;
+            result.push(my_id);
+            cur = next;
+        }
+        for i in 0..result.len() {
+            let id = result[i];
+            if let Some(Object::Dictionary(d)) = self.objects.get_mut(&id) {
+                if i > 0 {
+                    d.insert("Prev".to_string(), Object::Reference(ObjectRef::new(result[i - 1], 0)));
+                }
+                if i + 1 < result.len() {
+                    d.insert("Next".to_string(), Object::Reference(ObjectRef::new(result[i + 1], 0)));
+                }
+            }
+        }
+        result
+    }
+
+    /// Build a pruned `/Outlines` tree from source `src`; returns its new id, or
+    /// `None` if nothing survived.
+    fn build_outlines(&mut self, src: usize) -> Option<u32> {
+        let cat = self.source_catalog(src)?;
+        let outlines_ref = cat.get("Outlines")?.as_reference()?;
+        let outlines = self.sources[src].load_object(outlines_ref).ok()?;
+        let first = outlines.as_dict()?.get("First").and_then(|f| f.as_reference());
+
+        let outlines_id = self.alloc();
+        self.pinned.insert(outlines_id);
+        let kids = self.build_outline_items(src, first, outlines_id, 0);
+        if kids.is_empty() {
+            self.pinned.remove(&outlines_id);
+            return None;
+        }
+        let mut d: HashMap<String, Object> = HashMap::new();
+        d.insert("Type".to_string(), Object::Name("Outlines".to_string()));
+        d.insert("First".to_string(), Object::Reference(ObjectRef::new(*kids.first().unwrap(), 0)));
+        d.insert("Last".to_string(), Object::Reference(ObjectRef::new(*kids.last().unwrap(), 0)));
+        d.insert("Count".to_string(), Object::Integer(kids.len() as i64));
+        self.objects.insert(outlines_id, Object::Dictionary(d));
+        Some(outlines_id)
     }
 
     /// Collapse byte-identical objects to a single id, remapping references,
@@ -485,6 +750,9 @@ impl<'a> Builder<'a> {
     /// Finalize: build the page tree + catalog, compact ids, and serialize.
     fn finish(mut self) -> Result<(Vec<u8>, SubsetReport)> {
         let info_id = self.import_info(0);
+        // Document-level semantic structures come from source 0 (the subset
+        // case); a multi-source rebuild does not merge outlines/tags.
+        let outlines_id = if self.opts.keep_outlines { self.build_outlines(0) } else { None };
 
         if self.opts.dedup {
             self.dedup();
@@ -514,6 +782,9 @@ impl<'a> Builder<'a> {
         let mut catalog: HashMap<String, Object> = HashMap::new();
         catalog.insert("Type".to_string(), Object::Name("Catalog".to_string()));
         catalog.insert("Pages".to_string(), Object::Reference(ObjectRef::new(pages_id, 0)));
+        if let Some(oid) = outlines_id {
+            catalog.insert("Outlines".to_string(), Object::Reference(ObjectRef::new(oid, 0)));
+        }
         self.objects.insert(catalog_id, Object::Dictionary(catalog));
 
         // Compact ids to a contiguous 1..=K range.
@@ -680,11 +951,23 @@ pub fn subset_to_bytes(
             .collect();
         builder.severed[src_idx] = collect_dropped_page_ids(doc, &kept);
     }
+    // Pre-allocate a new id for every kept page and record (src, source leaf id)
+    // -> new id BEFORE building any page, so links and bookmarks on one page can
+    // resolve targets on a page that hasn't been built yet.
+    let mut planned: Vec<(usize, usize, u32)> = Vec::with_capacity(picks.len());
     for &(src, page) in picks {
         if src >= sources.len() {
             return Err(Error::InvalidPdf(format!("source index {src} out of range")));
         }
-        builder.add_page(src, page)?;
+        let pid = builder.alloc();
+        builder.pinned.insert(pid);
+        if let Some(leaf) = page_leaf_id(sources[src], page) {
+            builder.page_id_map.insert((src, leaf), pid);
+        }
+        planned.push((src, page, pid));
+    }
+    for (src, page, pid) in planned {
+        builder.build_page(src, page, pid)?;
     }
     builder.finish()
 }

@@ -406,8 +406,8 @@ fn subset_refuses_signed_page_when_policy_is_refuse() {
     let fixture = build_signed_fixture();
     let mut editor = DocumentEditor::from_bytes(fixture).expect("open editor");
     let opts = SubsetOptions {
-        dedup: true,
         on_signature: SignaturePolicy::Refuse,
+        ..SubsetOptions::default()
     };
     let result = editor.subset_pages_with_options(&[0], opts);
     assert!(result.is_err(), "Refuse policy must reject subsetting a signed page");
@@ -416,9 +416,170 @@ fn subset_refuses_signed_page_when_policy_is_refuse() {
     let mut editor2 =
         DocumentEditor::from_bytes(build_signed_fixture()).expect("open editor 2");
     let opts2 = SubsetOptions {
-        dedup: true,
         on_signature: SignaturePolicy::Refuse,
+        ..SubsetOptions::default()
     };
     let ok = editor2.subset_pages_with_options(&[1], opts2);
     assert!(ok.is_ok(), "an unsigned page can still be subset under Refuse");
+}
+
+/// Build a 3-page PDF with an outline (bookmarks) and link annotations that
+/// point at both kept and dropped pages, to exercise destination remapping +
+/// pruning.
+///
+///  Outline: "Chapter 1"->page0, "Chapter 2"->page2(dropped),
+///           "Chapter 3"->page1 with child "Section 3.1"->page2(dropped).
+///  Links:   page0 -> page1 (kept), page1 -> page2 (dropped).
+fn build_outline_fixture() -> Vec<u8> {
+    fn stream_obj(data: &[u8]) -> Vec<u8> {
+        let mut v = format!("<< /Length {} >>\nstream\n", data.len()).into_bytes();
+        v.extend_from_slice(data);
+        v.extend_from_slice(b"\nendstream");
+        v
+    }
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /Outlines 30 0 R >>".to_vec()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 /MediaBox [0 0 200 200] \
+              /Resources << /Font << /F1 10 0 R >> >> >>"
+                .to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [20 0 R] >>".to_vec()),
+        (4, stream_obj(b"BT /F1 12 Tf 20 100 Td (P0) Tj ET")),
+        (5, b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Annots [21 0 R] >>".to_vec()),
+        (6, stream_obj(b"BT /F1 12 Tf 20 100 Td (P1) Tj ET")),
+        (7, b"<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>".to_vec()),
+        (8, stream_obj(b"BT /F1 12 Tf 20 100 Td (P2) Tj ET")),
+        (10, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec()),
+        (20, b"<< /Type /Annot /Subtype /Link /Rect [10 10 50 50] /Dest [5 0 R /Fit] >>".to_vec()),
+        (21, b"<< /Type /Annot /Subtype /Link /Rect [10 10 50 50] /Dest [7 0 R /Fit] >>".to_vec()),
+        (30, b"<< /Type /Outlines /First 31 0 R /Last 33 0 R /Count 3 >>".to_vec()),
+        (
+            31,
+            b"<< /Title (Chapter 1) /Parent 30 0 R /Dest [3 0 R /Fit] /Next 32 0 R >>".to_vec(),
+        ),
+        (
+            32,
+            b"<< /Title (Chapter 2) /Parent 30 0 R /Prev 31 0 R /Next 33 0 R /Dest [7 0 R /Fit] >>"
+                .to_vec(),
+        ),
+        (
+            33,
+            b"<< /Title (Chapter 3) /Parent 30 0 R /Prev 32 0 R /Dest [5 0 R /Fit] \
+              /First 34 0 R /Last 34 0 R /Count 1 >>"
+                .to_vec(),
+        ),
+        (34, b"<< /Title (Section 3.1) /Parent 33 0 R /Dest [7 0 R /Fit] >>".to_vec()),
+    ];
+    let ids: Vec<u32> = objects.iter().map(|(id, _)| *id).collect();
+    let max_id = *ids.iter().max().unwrap() as usize;
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = vec![0usize; max_id + 1];
+    for (id, body) in &objects {
+        offsets[*id as usize] = out.len();
+        out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \r\n");
+    for id in 1..=max_id {
+        if ids.contains(&(id as u32)) {
+            out.extend_from_slice(format!("{:010} 00000 n \r\n", offsets[id]).as_bytes());
+        } else {
+            out.extend_from_slice(b"0000000000 00000 f \r\n");
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            max_id + 1,
+            xref_start
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// Outline titles in /First.. /Next order, and the /Type of each /Dest target.
+fn outline_titles_and_targets(doc: &PdfDocument) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(catalog) = doc.catalog() else { return out };
+    let Some(outlines) =
+        catalog.as_dict().and_then(|d| d.get("Outlines")).and_then(|o| resolve(doc, o))
+    else {
+        return out;
+    };
+    let mut cur = outlines.as_dict().and_then(|d| d.get("First")).and_then(|f| f.as_reference());
+    while let Some(item_ref) = cur {
+        let Ok(item) = doc.load_object(item_ref) else { break };
+        let Some(d) = item.as_dict() else { break };
+        let title = d
+            .get("Title")
+            .and_then(|t| t.as_string())
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let target = d
+            .get("Dest")
+            .and_then(|de| de.as_array())
+            .and_then(|a| a.first())
+            .and_then(|f| f.as_reference())
+            .and_then(|r| doc.load_object(r).ok())
+            .and_then(|o| o.as_dict().and_then(|dd| dd.get("Type")).and_then(|t| t.as_name()).map(String::from))
+            .unwrap_or_default();
+        out.push((title, target));
+        cur = d.get("Next").and_then(|n| n.as_reference());
+    }
+    out
+}
+
+#[test]
+fn subset_remaps_links_and_prunes_outlines() {
+    let fixture = build_outline_fixture();
+    let doc = PdfDocument::from_bytes(fixture).expect("parse fixture");
+
+    // Keep pages 0 and 1; drop page 2.
+    let (subset, report) =
+        pdf_oxide::editor::subset_to_bytes(&[&doc], &[(0, 0), (0, 1)], SubsetOptions::default())
+            .expect("subset");
+    let out = PdfDocument::from_bytes(subset).expect("subset parses");
+
+    // --- Outlines pruned to entries that still resolve to a kept page ---
+    let titles = outline_titles_and_targets(&out);
+    let kept: Vec<String> = titles.iter().map(|(t, _)| t.clone()).collect();
+    assert_eq!(
+        kept,
+        vec!["Chapter 1".to_string(), "Chapter 3".to_string()],
+        "Chapter 2 (-> dropped page) is pruned; Chapter 1 and 3 survive (got {kept:?})"
+    );
+    for (title, target) in &titles {
+        assert_eq!(target, "Page", "outline '{title}' must point at a real kept page");
+    }
+    assert_eq!(report.outline_entries, 2);
+
+    // --- Links: kept-page target preserved, dropped-page target severed ---
+    let p0 = out.get_page(0).unwrap();
+    let p0_link_has_dest = p0
+        .as_dict()
+        .and_then(|d| d.get("Annots"))
+        .and_then(|a| resolve(&out, a))
+        .and_then(|a| a.as_array().and_then(|arr| arr.first().cloned()))
+        .and_then(|e| resolve(&out, &e))
+        .map(|annot| annot.as_dict().map(|d| d.contains_key("Dest")).unwrap_or(false))
+        .unwrap_or(false);
+    assert!(p0_link_has_dest, "page 0's link to a kept page keeps its /Dest");
+
+    let p1 = out.get_page(1).unwrap();
+    let p1_link_has_dest = p1
+        .as_dict()
+        .and_then(|d| d.get("Annots"))
+        .and_then(|a| resolve(&out, a))
+        .and_then(|a| a.as_array().and_then(|arr| arr.first().cloned()))
+        .and_then(|e| resolve(&out, &e))
+        .map(|annot| annot.as_dict().map(|d| d.contains_key("Dest")).unwrap_or(false))
+        .unwrap_or(false);
+    assert!(!p1_link_has_dest, "page 1's link to a dropped page is severed");
+    assert!(report.links_severed >= 1, "at least one link was severed");
 }
